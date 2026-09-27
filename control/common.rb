@@ -141,7 +141,7 @@ class YamahaSerialInputWorker
 	# @param heartbeat_interval [Integer] how often to send heratbeat messages (in seconds)
 	# @return [nil] Never returns (intended to get killed). Retries Errno::EIO, but other
 	#   exceptions kill it.
-	def self.as_thread(device, remote_instance, heartbeat_interval = 5)
+	def self.as_thread(device, remote_instance, heartbeat_interval = 5, tx_interval = 0.02)
 		begin
 			SerialPort.open(device, {baud: 115200}) do |sp|
 				sp.set_encoding('ASCII-8BIT')
@@ -152,6 +152,11 @@ class YamahaSerialInputWorker
 				remote_instance.handle_received(:reset)
 
 				ypc = YamahaPacketCodec.new do |pkt|
+					if ENV['YAS207_PROTOCOL_TRACE'] == '1'
+						STDERR.puts format('TRACE %.6f RX %s',
+							Process.clock_gettime(Process::CLOCK_MONOTONIC),
+							pkt.pack('C*').unpack1('H*'))
+					end
 					STDERR.puts "YamahaSerialInputWorker: Incoming packet: #{pkt.map { |x| "%02x" % x }.join}" if $DEBUG || $VERBOSE
 					remote_instance.handle_received(pkt)
 				end
@@ -172,8 +177,15 @@ class YamahaSerialInputWorker
 					end
 					if cmd = remote_instance.pop
 						wait = false
+						if ENV['YAS207_PROTOCOL_TRACE'] == '1'
+							STDERR.puts format('TRACE %.6f TX %s',
+								Process.clock_gettime(Process::CLOCK_MONOTONIC),
+								cmd.unpack1('H*'))
+						end
 						STDERR.puts "YamahaSerialInputWorker: Sending: #{cmd.bytes.map { |x| "%02x" % x }.join}" if $DEBUG || $VERBOSE
 						sp.write(cmd)
+						remote_instance.handle_sent(cmd) if remote_instance.respond_to?(:handle_sent)
+						sleep tx_interval if tx_interval.positive?
 					end
 					sleep 0.05 if wait
 				end

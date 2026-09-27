@@ -79,8 +79,9 @@ class YamahaSoundbarRemote
 		bluetooth_standby_toggle: "407834",
 		dimmer: "4078ba",
 
-		# status report (query, soundbar returns a message)
-		report_status: "0305"
+		# status reports (queries; soundbar returns 0x05 and 0x12 respectively)
+		report_status: "0305",
+		report_volume: "0312"
 	}.freeze
 
 	# Mapping of input values to names
@@ -147,18 +148,22 @@ class YamahaSoundbarRemote
 		:mute, :volume, :surround, :bass_ext, :clearvoice, :subwoofer
 	].freeze
 
-	# Maximum number of emit-then-verify attempts for volume restoration
-	# before the staged restore is aborted as a failure. Each attempt is
-	# one enforce_intent cycle that emits relative volume commands and
-	# waits for the next 0x05 status reply.
-	MAX_VOLUME_RESTORE_ATTEMPTS = 5
-
 	# Staged restore phases.
-	# :volume   force mute + restore volume (closed-loop, bounded retry)
+	# :mute     force and verify temporary mute
+	# :volume   restore volume transactionally, with bounded correction
 	# :sound    restore clearvoice / surround / bass_ext / subwoofer
-	# :input    restore input (only after :volume AND :sound are verified)
+	# :input    restore input (only after :volume AND :sound verified)
+	# :post_input_volume verify volume/mute again while still muted
 	# :final_mute restore saved mute value
-	RESTORE_PHASES = [:volume, :sound, :input, :final_mute].freeze
+	RESTORE_PHASES = [
+		:mute, :volume, :sound, :input, :post_input_volume, :final_mute
+	].freeze
+
+	# A distinct 0x12 reply is the completion barrier for volume operations.
+	# Try direct correction first, then home to the lower boundary if needed.
+	MAX_VOLUME_RESTORE_CORRECTIONS = 2
+	VOLUME_HOME_MARGIN = 5
+	RESTORE_QUERY_TIMEOUT = 2.0
 
 	# Load configuration from disk. Falls back to {} if no config file
 	# exists; this preserves upstream legacy behaviour.
@@ -212,16 +217,26 @@ class YamahaSoundbarRemote
 		@intent = {}
 		@session = nil
 		@restoring_session = false
+		@restore_requested = false
 		@deferred_final_mute = nil
 		@snapshot_recovered = false
 		@restore_phase = nil
 		@restore_phase_status_refreshed = false
 		@restore_volume_attempts = 0
+		@restore_volume_homed = false
+		@restore_error = nil
+		@restore_id = 0
+		@restore_query_sent_at = nil
+		@enqueued_volume_queries = Queue.new
+		@sent_volume_queries = Queue.new
+		@status_generation = 0
+		@volume_status_generation = 0
 	end
 	attr_reader :device_state, :session, :restoring_session, :restore_phase,
 		:config, :runtime_dir, :rfcomm_device, :http_bind, :http_port,
 		:sync_timeout, :status_refresh, :manage_power, :initial_intent_mode,
-		:initial_intent_config, :snapshot_path
+		:initial_intent_config, :snapshot_path, :restore_error,
+		:status_generation, :volume_status_generation
 
 	# Handle packet received via serial.
 	#
@@ -230,9 +245,16 @@ class YamahaSoundbarRemote
 		if packet == :reset
 			@state = :initial
 			@queue.clear # no use pushing anything when the comm broke
+			@enqueued_volume_queries.clear
+			@sent_volume_queries.clear
+			@restore_query_sent_at = nil
 			@reset_at = Time.now
 			enqueue(INIT_STRING)
 		elsif packet == :heartbeat
+			if @restoring_session && @restore_query_sent_at &&
+				monotonic_now - @restore_query_sent_at > RESTORE_QUERY_TIMEOUT
+				fail_restore_volume(@intent, @device_state, 'timed out waiting for volume status')
+			end
 			if @state == :synced
 				if @last_status_at + @status_refresh < Time.now
 					@last_status_at = Time.now
@@ -261,7 +283,12 @@ class YamahaSoundbarRemote
 					# Trigger initial-intent application per tri-state.
 					# :absent => upstream legacy; :configured => @initial_intent_config;
 					# :present_empty => no initial intent applied.
-					if @initial_intent_mode == :absent || @initial_intent_mode == :configured
+					if @restoring_session
+						@restore_phase = :mute
+						@restore_volume_attempts = 0
+						@restore_error = nil
+						request_restore_mute_status
+					elsif @initial_intent_mode == :absent || @initial_intent_mode == :configured
 						add_intent({initial: true})
 					end
 					if packet != [0, 2, 0]
@@ -270,10 +297,11 @@ class YamahaSoundbarRemote
 				else
 					puts "? Received: #{packet.inspect}" # FIXME
 				end
-			when 0x05 # device status reply
+			when 0x05 # aggregate device status reply to report_status (03 05)
 				params = parse_device_status(packet)
 				puts "+ DS: #{params.map { |k,v| "#{k}:#{v}" }.join(',')}"
 				@device_state = params
+				@status_generation += 1
 
 				# Crash recovery: after first device-state observation, attempt to
 				# restore the persistent session snapshot if one exists. We do this
@@ -330,20 +358,29 @@ class YamahaSoundbarRemote
 						# Defer final mute restoration until staged restore settles.
 						@deferred_final_mute = saved[:mute] if saved.key?(:mute)
 						# STAGED RESTORE PHASES:
-						# 1. :volume   - force mute + restore volume with closed-loop
-						#                 verification (bounded retry)
-						# 2. :sound    - clearvoice, surround, bass_ext, subwoofer
-						# 3. :input    - restore input (ONLY after :volume AND :sound verified)
-						# 4. :final_mute - restore saved mute value
-						@restore_phase = :volume
+						# 1. :mute     - force and verify temporary mute
+						# 2. :volume   - restore volume as one verified transaction
+						# 3. :sound    - clearvoice, surround, bass_ext, subwoofer
+						# 4. :input    - restore input only after volume verification
+						# 5. :final_mute - restore saved mute value
+						@restore_phase = :mute
 						@restore_phase_status_refreshed = false
 						@restore_volume_attempts = 0
+						@restore_volume_homed = false
+						@restore_error = nil
+						@restore_id += 1
 						@restoring_session = true
+						@restore_requested = false
+						request_restore_mute_status
+					else
+						@restore_requested = false
 					end
 				end
 				# and now enforce it
 				if @restoring_session && @restore_phase
-					@intent = enforce_staged_restore(@intent, @device_state.dup)
+					unless [:mute, :volume, :post_input_volume, :final_mute, :failed].include?(@restore_phase)
+						@intent = enforce_staged_restore(@intent, @device_state.dup)
+					end
 				elsif !@intent.empty?
 					keys = @restoring_session ? RESTORE_KEYS : APPLY_KEYS
 					@intent = enforce_intent(@intent, keys_to_enforce: keys)
@@ -359,6 +396,17 @@ class YamahaSoundbarRemote
 							delete_session_snapshot
 						end
 					end
+				end
+			when 0x12 # volume/mute reply to report_volume (03 12)
+				params = parse_volume_status(packet)
+				@device_state.update(params)
+				@volume_status_generation += 1
+				puts "+ VS: mute:#{params[:mute]},volume:#{params[:volume]},generation:#{@volume_status_generation}"
+				query = pop_queue(@sent_volume_queries)
+				if query.is_a?(Hash) && query[:restore_id] == @restore_id &&
+					query[:phase] == @restore_phase
+					@restore_query_sent_at = nil
+					@intent = handle_restore_volume_status(@intent, params)
 				end
 			else
 				puts "? Received: #{packet.inspect}" # FIXME
@@ -380,10 +428,38 @@ class YamahaSoundbarRemote
 		params
 	end
 
-	private def enqueue(command)
+	private def parse_volume_status(pkt)
+		{
+			mute: !pkt[1].zero?,
+			volume: pkt[2],
+		}
+	end
+
+	private def monotonic_now
+		Process.clock_gettime(Process::CLOCK_MONOTONIC)
+	end
+
+	private def pop_queue(queue)
+		queue.pop(true)
+	rescue ThreadError
+		nil
+	end
+
+	private def enqueue(command, volume_query: nil)
 		cmd = YamahaPacketCodec.encode(command)
+		if cmd == YamahaPacketCodec.encode(COMMANDS[:report_volume])
+			@enqueued_volume_queries.push(volume_query || :external)
+		end
 		@queue.push([Time.now, cmd])
 		cmd
+	end
+
+	def handle_sent(command)
+		return unless command == YamahaPacketCodec.encode(COMMANDS[:report_volume])
+
+		query = pop_queue(@enqueued_volume_queries) || :external
+		@sent_volume_queries.push(query)
+		@restore_query_sent_at = monotonic_now if query.is_a?(Hash)
 	end
 
 	# Add given intent
@@ -407,6 +483,10 @@ class YamahaSoundbarRemote
 		return {} if delta_keys.empty? # zero diff → stable state reached
 		# also zero diff (mute doesn't work when powered off) >>
 		return {} if delta_keys == [:mute] && device_state[:power] == false
+		if retried
+			STDERR.puts "~ enforce_intent: loop breaker: #{intent.inspect} on #{device_state}, delta: #{delta_keys}" if $VERBOSE || $DEBUG
+			return {}
+		end
 
 		# Pathological case: device is off but other intents exist. Upstream
 		# auto-powers-on here; we only do so when manage_power is true.
@@ -445,14 +525,9 @@ class YamahaSoundbarRemote
 			end
 		end
 
-		if retried
-			STDERR.puts "~ enforce_intent: loop breaker: #{intent.inspect} on #{device_state}, delta: #{delta_keys}" if $VERBOSE || $DEBUG
-			{}
-		else
-			# had a diff, let's have another round after this one
-			enqueue(COMMANDS[:report_status])
-			intent.update({enforce_retried: true}) # avoid endless looping
-		end
+		# Had a diff; request one verification round without re-emitting the batch.
+		enqueue(COMMANDS[:report_status])
+		intent.update({enforce_retried: true})
 	end
 
 	# Send raw command to device -- called by end users (if they speak raw).
@@ -460,6 +535,7 @@ class YamahaSoundbarRemote
 	# @param command [Array<Integer>, String] command understood by `YamahaPacketCodec.encode()`.
 	# @raise [RuntimeError] when device not ready
 	def send_raw(command)
+		ensure_not_restoring!
 		if @state == :synced
 			enqueue(command)
 		else
@@ -467,102 +543,165 @@ class YamahaSoundbarRemote
 		end
 	end
 
-	# Staged restore with explicit per-phase verification.
-	#
-	# Each phase is gated by the previous phase having converged:
-	#
-	#   :volume      force mute + restore volume, closed-loop verify,
-	#                bounded retry; ABORT (no input switch) if not converged
-	#   :sound       restore clearvoice / surround / bass_ext / subwoofer
-	#   :input       restore input (only after :volume AND :sound are verified)
-	#   :final_mute  restore saved mute value
-	#
-	# The first action in each phase is to enqueue a `report_status` and
-	# wait for the next 0x05 reply. This guarantees every phase begins
-	# with a FRESH device-state readback, not a stale cached value.
-	#
-	# Returns the (possibly modified) intent for the next enforce_intent
-	# pass to process.
+	# Staged restore with explicit per-phase verification. The input phase is
+	# unreachable until a distinct 0x12 reply has confirmed the saved volume.
 	private def enforce_staged_restore(intent, device_state)
 		# Strip :power from intent unless we manage it.
 		intent.delete(:power) unless @manage_power
 
 		case @restore_phase
-		when :volume
-			enforce_restore_volume_phase(intent, device_state)
 		when :sound
 			enforce_restore_sound_phase(intent, device_state)
 		when :input
 			enforce_restore_input_phase(intent, device_state)
-		when :final_mute
-			enforce_restore_final_mute_phase(intent, device_state)
 		else
-			# Should not happen; defensively exit restore mode.
-			STDERR.puts "! Unknown restore phase: #{@restore_phase}; aborting restore."
-			@restore_phase = nil
-			@restoring_session = false
-			delete_session_snapshot
-			{}
+			@restore_error = "unknown restore phase: #{@restore_phase}"
+			@restore_phase = :failed
+			STDERR.puts "! #{@restore_error}; input remains unchanged and snapshot is preserved."
+			intent
 		end
 	end
 
-	# Phase :volume.
-	#
-	# 1. First pass after entering phase: enqueue report_status to obtain
-	#    a fresh status readback BEFORE computing the volume delta.
-	# 2. Subsequent passes: read fresh status, compute delta, emit
-	#    volume_up/volume_down commands. Bound the number of attempts
-	#    to MAX_VOLUME_RESTORE_ATTEMPTS. If still not converged, ABORT
-	#    the staged restore (do NOT switch to :input phase).
-	#
-	# Note: :mute is handled separately (forced temporary mute on
-	# phase entry; final mute restored in :final_mute phase). Volume
-	# commands are not issued until we have a fresh status readback
-	# so the delta calculation is never based on a stale cached value.
-	private def enforce_restore_volume_phase(intent, device_state)
-		if !@restore_phase_status_refreshed
-			# Phase entry: force a fresh status readback before any volume
-			# computation. The next 0x05 reply will trigger this method again
-			# with @restore_phase_status_refreshed = true.
-			@restore_phase_status_refreshed = true
-			enqueue(COMMANDS[:report_status])
-			return intent.update({enforce_retried: true})
+	private def request_restore_mute_status
+		enqueue(COMMANDS[:mute_on])
+		enqueue_restore_volume_query(:mute)
+	end
+
+	private def enqueue_restore_volume_query(phase)
+		enqueue(
+			COMMANDS[:report_volume],
+			volume_query: {restore_id: @restore_id, phase: phase},
+		)
+	end
+
+	# Handle only replies to the narrow volume/mute query. Heartbeat status
+	# packets cannot enter this feedback loop, eliminating stale compensation.
+	private def handle_restore_volume_status(intent, status)
+		return verify_restore_final_mute(intent, status) if @restore_phase == :final_mute
+		return verify_post_input_volume(intent, status) if @restore_phase == :post_input_volume
+
+		target = intent[:volume]
+		return advance_restore_to_sound(intent) unless target
+
+		if @restore_phase == :mute
+			unless status[:mute]
+				@restore_volume_attempts += 1
+				return fail_restore_volume(intent, status, 'temporary mute not confirmed') if @restore_volume_attempts > MAX_VOLUME_RESTORE_CORRECTIONS
+
+				request_restore_mute_status
+				return intent
+			end
+
+			@restore_volume_attempts = 0
+			return queue_restore_volume_delta(intent, target - status[:volume])
 		end
 
-		# We have a fresh status. Compare against saved volume.
-		volume_delta = intent[:volume] - device_state[:volume]
+		return advance_restore_to_sound(intent) if status[:volume] == target && status[:mute]
 
-		if volume_delta == 0
-			# Volume has converged on the saved level. Advance to :sound.
-			@restore_volume_attempts = 0
-			@restore_phase_status_refreshed = false
-			@restore_phase = :sound
-			enqueue(COMMANDS[:report_status])
-			return intent.update({enforce_retried: true})
+		if status[:volume] == target
+			@restore_volume_attempts += 1
+			return fail_restore_volume(intent, status, 'temporary mute not retained') if @restore_volume_attempts > MAX_VOLUME_RESTORE_CORRECTIONS
+
+			enqueue(COMMANDS[:mute_on])
+			enqueue_restore_volume_query(:volume)
+			return intent
 		end
 
 		@restore_volume_attempts += 1
-		if @restore_volume_attempts > MAX_VOLUME_RESTORE_ATTEMPTS
-			# Bounded retry exhausted. ABORT restore; do NOT switch input.
-			# Leave YAS in a muted state (the forced temporary mute is still on).
-			STDERR.puts "! Volume restore did not converge after " \
-				"#{MAX_VOLUME_RESTORE_ATTEMPTS} attempts: " \
-				"target=#{intent[:volume]} actual=#{device_state[:volume]}; " \
-				"aborting staged restore (input NOT switched)"
+		if @restore_volume_attempts <= MAX_VOLUME_RESTORE_CORRECTIONS
+			STDERR.puts "! Correcting verified volume mismatch: target=#{target} actual=#{status[:volume]} attempt=#{@restore_volume_attempts}"
+			return queue_restore_volume_delta(intent, target - status[:volume])
+		end
+
+		unless @restore_volume_homed
+			@restore_volume_homed = true
+			STDERR.puts "! Direct volume correction failed; homing to raw 0 before restoring #{target}."
+			queue_restore_volume_steps(:volume_down, VOLUME_RANGE.max + VOLUME_HOME_MARGIN)
+			queue_restore_volume_steps(:volume_up, target)
+			enqueue_restore_volume_query(:volume)
+			return intent
+		end
+
+		fail_restore_volume(intent, status, 'volume mismatch after lower-bound homing')
+	end
+
+	private def queue_restore_volume_delta(intent, delta)
+		return advance_restore_to_sound(intent) if delta.zero?
+
+		@restore_phase = :volume
+		queue_restore_volume_steps(delta.negative? ? :volume_down : :volume_up, delta.abs)
+		enqueue_restore_volume_query(:volume)
+		intent
+	end
+
+	# Relative volume commands clear mute on real hardware. Reassert mute after
+	# every step so the unmuted interval is bounded by the TX cadence.
+	private def queue_restore_volume_steps(command, count)
+		count.times do
+			enqueue(COMMANDS[command])
+			enqueue(COMMANDS[:mute_on])
+		end
+	end
+
+	private def advance_restore_to_sound(intent)
+		@restore_phase = :sound
+		@restore_phase_status_refreshed = true
+		enqueue(COMMANDS[:report_status])
+		intent
+	end
+
+	private def fail_restore_volume(intent, status, reason)
+		@restore_error = "#{reason}: target=#{intent[:volume]} actual=#{status[:volume]}"
+		@restore_phase = :failed
+		@restore_query_sent_at = nil
+		STDERR.puts "! Restore failed; input will not be changed further and snapshot is preserved: #{@restore_error}"
+		intent
+	end
+
+	private def begin_restore_final_mute(intent)
+		@restore_phase = :final_mute
+		@restore_volume_attempts = 0
+		unless @deferred_final_mute.nil?
+			enqueue(COMMANDS[@deferred_final_mute ? :mute_on : :mute_off])
+		end
+		enqueue_restore_volume_query(:final_mute)
+		intent
+	end
+
+	private def verify_post_input_volume(intent, status)
+		unless status[:volume] == intent[:volume] && status[:mute]
+			enqueue(COMMANDS[:mute_on]) unless status[:mute]
+			return fail_restore_volume(intent, status, 'volume/mute changed during input restoration')
+		end
+
+		begin_restore_final_mute(intent)
+	end
+
+	private def verify_restore_final_mute(intent, status)
+		final_mute = @deferred_final_mute
+		if status[:volume] != intent[:volume]
+			enqueue(COMMANDS[:mute_on])
+			return fail_restore_volume(intent, status, 'volume changed after input restoration')
+		end
+
+		if status[:volume] == intent[:volume] &&
+			(final_mute.nil? || status[:mute] == final_mute)
+			@deferred_final_mute = nil
 			@restore_phase = nil
 			@restoring_session = false
-			@deferred_final_mute = nil
+			@restore_error = nil
 			delete_session_snapshot
 			return {}
 		end
 
-		# Emit the relative commands based on the FRESH device_state value.
-		volume_delta.abs.times {
-			enqueue(COMMANDS[volume_delta < 0 ? :volume_down : :volume_up]) }
-		# Always enqueue a report_status after commands so the NEXT pass
-		# has a fresh readback to verify against.
-		enqueue(COMMANDS[:report_status])
-		intent.update({enforce_retried: true})
+		@restore_volume_attempts += 1
+		if @restore_volume_attempts <= MAX_VOLUME_RESTORE_CORRECTIONS
+			enqueue(COMMANDS[final_mute ? :mute_on : :mute_off]) unless final_mute.nil?
+			enqueue_restore_volume_query(:final_mute)
+			return intent
+		end
+
+		fail_restore_volume(intent, status, 'final volume/mute verification failed')
 	end
 
 	# Phase :sound.
@@ -626,11 +765,9 @@ class YamahaSoundbarRemote
 		end
 
 		if device_state[:input] == intent[:input]
-			# Input already at target. Advance to :final_mute.
-			@restore_phase_status_refreshed = false
-			@restore_phase = :final_mute
-			enqueue(COMMANDS[:report_status])
-			return intent.update({enforce_retried: true})
+			@restore_phase = :post_input_volume
+			enqueue_restore_volume_query(:post_input_volume)
+			return intent
 		end
 
 		# Emit input switch.
@@ -639,43 +776,13 @@ class YamahaSoundbarRemote
 		intent.update({enforce_retried: true})
 	end
 
-	# Phase :final_mute.
-	#
-	# Restore the saved mute value. After this settles, the staged
-	# restore is complete: clear @restoring_session and the snapshot.
-	private def enforce_restore_final_mute_phase(intent, device_state)
-		# Force a fresh readback before deciding whether to emit mute_on/off.
-		if !@restore_phase_status_refreshed
-			@restore_phase_status_refreshed = true
-			enqueue(COMMANDS[:report_status])
-			return intent.update({enforce_retried: true})
-		end
-
-		if !@deferred_final_mute.nil?
-			final = @deferred_final_mute
-			@deferred_final_mute = nil
-			# Emit the saved mute value if it differs.
-			if device_state[:mute] != final
-				enqueue(COMMANDS[(final ? :mute_on : :mute_off)])
-				enqueue(COMMANDS[:report_status])
-				intent.update({enforce_retried: true})
-				return intent
-			end
-		end
-
-		# Staged restore complete.
-		@restore_phase = nil
-		@restoring_session = false
-		delete_session_snapshot
-		{}
-	end
-
 	# Send a command to device -- called by end users.
 	#
 	# @param command [Symbol, String] name of the command to send.
 	# @raise [RuntimeError] when device not ready
 	# @raise [ArgumentError] when the command is wrong
 	def send(command)
+		ensure_not_restoring!
 		if @state == :synced
 			if c = COMMANDS[command.to_sym]
 				enqueue(c)
@@ -695,6 +802,7 @@ class YamahaSoundbarRemote
 	# @raise [RuntimeError] when device not ready
 	# @raise [ArgumentError] when the intent is wrong
 	def start_session(name, intent)
+		ensure_not_restoring!
 		if @state == :synced
 			add_intent(parse_intent(intent).update({start_session: name}))
 		else
@@ -708,8 +816,15 @@ class YamahaSoundbarRemote
 	# @raise [RuntimeError] when device not ready
 	# @raise [ArgumentError] when the intent is wrong
 	def stop_session(name)
+		ensure_not_restoring!
 		if @state == :synced
-			add_intent({stop_session: name})
+			@restore_requested = true
+			begin
+				add_intent({stop_session: name})
+			rescue
+				@restore_requested = false
+				raise
+			end
 		else
 			raise RuntimeError, "device not ready"
 		end
@@ -721,6 +836,7 @@ class YamahaSoundbarRemote
 	# @raise [RuntimeError] when device not ready
 	# @raise [ArgumentError] when the intent is wrong
 	def send_intent(intent)
+		ensure_not_restoring!
 		if @state == :synced
 			add_intent(parse_intent(intent))
 		else
@@ -783,6 +899,12 @@ class YamahaSoundbarRemote
 		# manage_power=false: strip :power from user-supplied intents.
 		validated_intent.delete(:power) unless @manage_power
 		validated_intent
+	end
+
+	private def ensure_not_restoring!
+		if @restore_requested || @restoring_session
+			raise RuntimeError, "session restore in progress"
+		end
 	end
 
 	# Fetch next packet to be sent to device -- called by comm handler.
@@ -939,6 +1061,12 @@ if __FILE__ == $0
 					'name'      => ysr.session ? ysr.session.first : nil,
 					'active'    => !ysr.session.nil?,
 					'restoring' => ysr.restoring_session,
+					'restore_phase' => ysr.restore_phase,
+					'restore_error' => ysr.restore_error,
+				},
+				'protocol' => {
+					'status_generation' => ysr.status_generation,
+					'volume_status_generation' => ysr.volume_status_generation,
 				},
 			})
 		end
