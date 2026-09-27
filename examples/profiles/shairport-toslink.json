@@ -1,0 +1,48 @@
+{
+  "_comment": [
+    "Upstream-style profile: Shairport Sync over ALSA SPDIF/TOSLINK to YAS-207 TV input.",
+    "Mirrors the original wejn.org blog post design.",
+    "Requires no Sendspin adapter; uses the upstream shairport integration scripts",
+    "in adapters/shairport/ with shairport-sync.conf run_this_* directives."
+  ],
+
+  "controller": {
+    "rfcomm_device":             "/dev/rfcomm0",
+    "rfcomm_channel":            1,
+    "bluetooth_address":         "REPLACE_WITH_YAS_BDADDR",
+    "http_bind":                 "127.0.0.1",
+    "http_port":                 8000,
+    "sync_timeout_seconds":      15,
+    "status_refresh_seconds":    30,
+    "manage_power":              true,
+    "initial_intent":            {}
+  },
+
+  "session": {
+    "name":                       "airplay",
+    "music_intent": {
+      "input":      "tv",
+      "surround":   "music"
+    },
+    "stop_debounce_seconds":     0,
+    "disconnect_spp_after_session": false
+  },
+
+  "volume": {
+    "min_nonzero_raw":           1,
+    "max_raw":                   50,
+    "zero_is_mute":              false,
+    "default_percent":           50,
+    "remember_when_inactive":    false
+  },
+
+  "player": {
+    "type":          "shairport",
+    "audio_format":  "pcm:44100:16:2",
+    "hooks": {
+      "start":      "/usr/local/sbin/yas207/adapters/shairport/turn-on.sh",
+      "stop":       "/usr/local/sbin/yas207/adapters/shairport/turn-off.sh",
+      "set_volume": "/usr/local/sbin/yas207/adapters/shairport/volume-control.rb"
+    }
+  }
+}
