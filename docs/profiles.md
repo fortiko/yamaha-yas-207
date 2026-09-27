@@ -35,7 +35,6 @@ These are baked into `control/control.rb` and never read from config.
 | `controller.http_port` | `8000` | upstream default |
 | `controller.sync_timeout_seconds` | `15` | upstream `SYNC_TIMEOUT` |
 | `controller.status_refresh_seconds` | `30` | upstream `STATUS_REFRESH` |
-| `session.disconnect_spp_after_session` | `false` | upstream persistent-SPP behaviour |
 | `volume.min_nonzero_raw` | `1` | safe floor |
 | `volume.max_raw` | `50` | YAS hardware max, NOT a tuned preference |
 | `volume.zero_is_mute` | `false` | raw `0` is a valid Yamaha silent state |
@@ -81,7 +80,8 @@ the upstream blog post:
 
 * `manage_power: true` (legacy)
 * `initial_intent` absent (legacy)
-* `disconnect_spp_after_session: false` (legacy persistent SPP)
+
+
 * `music_intent: {input: "tv", surround: "music"}` (TV is the music input for TOSLINK)
 * `volume.max_raw: 50` (full hardware range)
 * `volume.zero_is_mute: false` (raw 0 is fine)

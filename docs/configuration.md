@@ -73,7 +73,6 @@ or keep the legacy upstream defaults without any new key.
 | `name` | string | **required** | upstream session identifier |
 | `music_intent` | object | **required** | static intent applied on `start-session`. **Must NOT contain `volume` or `mute` when `player.hardware_volume == false`;** the adapter owns those fields |
 | `stop_debounce_seconds` | int ≥ 0 | `10` | adapter-side debounce on STOP events |
-| `disconnect_spp_after_session` | bool | `false` | reserved; future opt-in (currently ignored) |
 
 Keys in `music_intent` not listed here (e.g. `surround`, `bass_ext`,
 `subwoofer`) are passed through to upstream's `parse_intent` for validation.

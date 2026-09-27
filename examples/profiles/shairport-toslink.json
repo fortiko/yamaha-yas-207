@@ -24,8 +24,7 @@
       "input":      "tv",
       "surround":   "music"
     },
-    "stop_debounce_seconds":     0,
-    "disconnect_spp_after_session": false
+    "stop_debounce_seconds":     0
   },
 
   "volume": {

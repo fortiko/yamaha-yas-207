@@ -24,8 +24,7 @@
       "input":      "analog",
       "clearvoice": false
     },
-    "stop_debounce_seconds":     10,
-    "disconnect_spp_after_session": false
+    "stop_debounce_seconds":     10
   },
 
   "volume": {
@@ -41,8 +40,7 @@
     "name":        "Example Room",
     "interface":   "192.0.2.135",
     "audio_device": {
-      "match":          "Example ALSA Device",
-      "index_override": 0
+      "match": "Example ALSA Device"
     },
     "audio_format":   "flac:48000:16:2",
     "hardware_volume": false,
