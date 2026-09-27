@@ -196,7 +196,10 @@ class YamahaSoundbarRemote
 		@deferred_final_mute = nil
 		@snapshot_recovered = false
 	end
-	attr_reader :device_state, :session, :restoring_session, :config, :runtime_dir
+	attr_reader :device_state, :session, :restoring_session, :config, :runtime_dir,
+		:rfcomm_device, :http_bind, :http_port, :sync_timeout, :status_refresh,
+		:manage_power, :initial_intent_mode, :initial_intent_config,
+		:snapshot_path
 
 	# Handle packet received via serial.
 	#
@@ -607,8 +610,8 @@ if __FILE__ == $0
 	threads << Thread.new do
 		print "+ Webserver...\n"
 		s = WEBrick::HTTPServer.new({
-			:Port => ysr.instance_variable_get(:@http_port),
-			:BindAddress => ysr.instance_variable_get(:@http_bind),
+			:Port => ysr.http_port,
+			:BindAddress => ysr.http_bind,
 			:Logger => WEBrick::Log.new('/dev/null'),
 			:AccessLog => [ [$stdout, "> %h %U %b"] ],
 			:DoNotReverseLookup => true,
