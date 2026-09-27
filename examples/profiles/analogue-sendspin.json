@@ -48,9 +48,9 @@
     "hardware_volume": false,
     "use_mpris":      false,
     "hooks": {
-      "start":      "yas207-sendspin start",
-      "stop":       "yas207-sendspin stop",
-      "set_volume": "yas207-sendspin volume"
+      "start":      "/usr/local/sbin/yas207/yas207-sendspin start",
+      "stop":       "/usr/local/sbin/yas207/yas207-sendspin stop",
+      "set_volume": "/usr/local/sbin/yas207/yas207-sendspin volume"
     }
   }
 }
