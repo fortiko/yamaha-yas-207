@@ -1,0 +1,515 @@
+#!/usr/bin/env python3
+"""Sendspin adapter for the Yamaha YAS-207 controller.
+
+This is the SINGLE entry point that Sendspin's --hook-start, --hook-stop
+and --hook-set-volume directives all invoke. argv[1] dispatches:
+
+  yas207-sendspin start      (Sendspin's stream-start hook)
+  yas207-sendspin stop       (Sendspin's stream-stop hook)
+  yas207-sendspin cleanup T  (internal: spawned by `stop` after debounce)
+  yas207-sendspin volume N   (Sendspin's volume hook)
+
+The adapter is the only process that ever contacts the upstream controller
+at /start-session or /stop-session. It owns its own runtime state under
+/run/user/<euid>/yas207/ (state.json, lock, log).
+
+See docs/configuration.md for the configuration schema and
+docs/profiles.md for the rationale of policy values.
+"""
+
+from __future__ import annotations
+
+import argparse
+import contextlib
+import errno
+import fcntl
+import json
+import os
+import secrets
+import subprocess
+import sys
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+from pathlib import Path
+from typing import Any
+
+SCHEMA_VERSION = 1
+
+REQUIRED_TOP_LEVEL_KEYS = ("controller", "session", "volume", "player")
+
+
+def runtime_dir() -> Path:
+    override = os.environ.get("YAS207_RUNTIME_DIR")
+    if override:
+        return Path(override)
+    return Path(f"/run/user/{os.getuid()}/yas207")
+
+
+def load_config(path: Path | None = None) -> dict:
+    cfg_path = path or Path(
+        os.environ.get("YAS207_CONFIG")
+        or (Path.home() / ".config" / "yas207" / "controller.json")
+    )
+    if not cfg_path.exists():
+        die(f"config file not found: {cfg_path}", code=2)
+    try:
+        cfg = json.loads(cfg_path.read_text())
+    except json.JSONDecodeError as e:
+        die(f"config file is not valid JSON: {cfg_path}: {e}", code=2)
+    validate_config(cfg)
+    return cfg
+
+
+def die(msg: str, code: int = 1) -> None:
+    sys.stderr.write(f"yas207-sendspin: {msg}\n")
+    sys.exit(code)
+
+
+def validate_config(cfg: dict) -> None:
+    for key in REQUIRED_TOP_LEVEL_KEYS:
+        if key not in cfg:
+            die(f"config missing required top-level key: {key}", code=2)
+
+    ctrl = cfg["controller"]
+    for key in (
+        "rfcomm_device", "rfcomm_channel", "bluetooth_address",
+        "http_bind", "http_port", "manage_power",
+    ):
+        if key not in ctrl:
+            die(f"config.controller missing required key: {key}", code=2)
+    if not isinstance(ctrl["rfcomm_channel"], int) or not 1 <= ctrl["rfcomm_channel"] <= 30:
+        die("controller.rfcomm_channel must be integer 1..30", code=2)
+    import re
+    if not re.match(r"^[0-9A-Fa-f]{2}(:[0-9A-Fa-f]{2}){5}$", ctrl["bluetooth_address"]):
+        die("controller.bluetooth_address must match XX:XX:XX:XX:XX:XX", code=2)
+    if not isinstance(ctrl["http_port"], int) or not 1 <= ctrl["http_port"] <= 65535:
+        die("controller.http_port must be integer 1..65535", code=2)
+    if not isinstance(ctrl["manage_power"], bool):
+        die("controller.manage_power must be boolean", code=2)
+
+    sess = cfg["session"]
+    for key in ("name", "music_intent", "stop_debounce_seconds"):
+        if key not in sess:
+            die(f"config.session missing required key: {key}", code=2)
+    if not isinstance(sess["name"], str) or not sess["name"]:
+        die("session.name must be a non-empty string", code=2)
+    if not isinstance(sess["music_intent"], dict):
+        die("session.music_intent must be an object", code=2)
+    if not isinstance(sess["stop_debounce_seconds"], int) or sess["stop_debounce_seconds"] < 0:
+        die("session.stop_debounce_seconds must be integer >= 0", code=2)
+    for key in ("volume", "mute"):
+        if key in sess["music_intent"]:
+            die(
+                "session.music_intent must NOT contain "
+                f"'{key}' when player.hardware_volume == false",
+                code=2,
+            )
+    if "power" in sess["music_intent"] and not ctrl["manage_power"]:
+        die(
+            "session.music_intent must NOT contain 'power' when "
+            "controller.manage_power == false",
+            code=2,
+        )
+
+    vol = cfg["volume"]
+    for key in ("min_nonzero_raw", "max_raw", "zero_is_mute", "default_percent",
+                "remember_when_inactive"):
+        if key not in vol:
+            die(f"config.volume missing required key: {key}", code=2)
+    if not 1 <= vol["min_nonzero_raw"] <= 50:
+        die("volume.min_nonzero_raw must be in 1..50", code=2)
+    if not 0 <= vol["max_raw"] <= 50:
+        die("volume.max_raw must be in 0..50 (YAS hardware max)", code=2)
+    if vol["max_raw"] < vol["min_nonzero_raw"]:
+        die("volume.max_raw must be >= volume.min_nonzero_raw", code=2)
+    if vol["zero_is_mute"] and vol["min_nonzero_raw"] < 1:
+        die("volume.min_nonzero_raw must be >= 1 when zero_is_mute == true", code=2)
+    if not 0 <= vol["default_percent"] <= 100:
+        die("volume.default_percent must be integer 0..100", code=2)
+
+    ply = cfg["player"]
+    if ply.get("type") != "sendspin":
+        die("this adapter is for player.type=='sendspin' only", code=2)
+    for key in ("name", "interface", "audio_device", "audio_format",
+                "hardware_volume", "use_mpris", "hooks"):
+        if key not in ply:
+            die(f"config.player missing required key: {key}", code=2)
+    if not isinstance(ply["audio_device"], dict):
+        die("player.audio_device must be an object", code=2)
+    if not (ply["audio_device"].get("match") or ply["audio_device"].get("index_override") is not None):
+        die("player.audio_device must contain at least one of 'match' or 'index_override'", code=2)
+    import re as _re
+    if not _re.match(r"^(pcm|flac):\d+:\d+:[12]$", ply["audio_format"]):
+        die("player.audio_format must match ^(pcm|flac):<rate>:<bits>:<channels>$", code=2)
+    for hook in ("start", "stop", "set_volume"):
+        if hook not in ply["hooks"] or not ply["hooks"][hook]:
+            die(f"player.hooks.{hook} must be a non-empty string", code=2)
+
+
+class Log:
+    def __init__(self, path: Path):
+        self.path = path
+        path.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            path.chmod(0o600)
+        except OSError:
+            pass
+
+    def write(self, level: str, action: str, msg: str) -> None:
+        stamp = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+        line = f"{stamp} {level} action={action}: {msg}\n"
+        try:
+            with self.path.open("a") as f:
+                f.write(line)
+        except OSError:
+            pass
+        sys.stderr.write(line)
+
+
+class State:
+    """Persistent adapter state under /run/user/<euid>/yas207/state.json."""
+
+    def __init__(self, path: Path):
+        self.path = path
+        path.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            path.chmod(0o700)
+        except OSError:
+            pass
+        self._cache: dict | None = None
+
+    def _read(self) -> dict:
+        if self._cache is not None:
+            return self._cache
+        if not self.path.exists():
+            self._cache = self._default()
+            return self._cache
+        try:
+            data = json.loads(self.path.read_text())
+        except (json.JSONDecodeError, OSError):
+            data = self._default()
+        self._cache = data
+        return data
+
+    def _write(self) -> None:
+        assert self._cache is not None
+        tmp = self.path.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps(self._cache, indent=2, sort_keys=True))
+        os.chmod(tmp, 0o600)
+        os.replace(tmp, self.path)
+
+    def _default(self) -> dict:
+        return {
+            "schema": SCHEMA_VERSION,
+            "session_active": False,
+            "desired_ma_percent": None,
+            "pending_stop_token": None,
+            "last_started_at": None,
+        }
+
+    def snapshot(self) -> dict:
+        return dict(self._read())
+
+    def update(self, **changes: Any) -> None:
+        data = self._read()
+        data.update(changes)
+        self._write()
+
+
+class Lock:
+    """flock-based serialisation for all adapter operations."""
+
+    def __init__(self, path: Path):
+        self.path = path
+        path.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            path.chmod(0o600)
+        except OSError:
+            pass
+        self._fd: int | None = None
+
+    def __enter__(self):
+        self._fd = os.open(self.path, os.O_CREAT | os.O_RDWR, 0o600)
+        fcntl.flock(self._fd, fcntl.LOCK_EX)
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        if self._fd is not None:
+            fcntl.flock(self._fd, fcntl.LOCK_UN)
+            os.close(self._fd)
+            self._fd = None
+
+
+def controller_url(cfg: dict, path: str) -> str:
+    bind = cfg["controller"]["http_bind"]
+    port = cfg["controller"]["http_port"]
+    return f"http://{bind}:{port}{path}"
+
+
+def http_post(cfg: dict, path: str, data: dict, timeout: float = 5.0):
+    body = urllib.parse.urlencode(data).encode()
+    req = urllib.request.Request(
+        controller_url(cfg, path),
+        data=body,
+        method="POST",
+        headers={"Content-Type": "application/x-www-form-urlencoded"},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return r.status, r.read().decode()
+    except urllib.error.HTTPError as e:
+        return e.code, e.read().decode() if e.fp else ""
+    except (urllib.error.URLError, TimeoutError, OSError) as e:
+        return 0, f"network-error: {e}"
+
+
+def http_get(cfg: dict, path: str, timeout: float = 5.0):
+    url = controller_url(cfg, path)
+    try:
+        with urllib.request.urlopen(url, timeout=timeout) as r:
+            return r.status, r.read().decode()
+    except urllib.error.HTTPError as e:
+        return e.code, e.read().decode() if e.fp else ""
+    except (urllib.error.URLError, TimeoutError, OSError) as e:
+        return 0, f"network-error: {e}"
+
+
+def ma_to_raw(ma_percent: int, vol_cfg: dict) -> int:
+    if ma_percent <= 0:
+        return 0
+    raw = round(ma_percent * vol_cfg["max_raw"] / 100)
+    return max(vol_cfg["min_nonzero_raw"], raw)
+
+
+def compute_music_intent(cfg: dict, ma_percent: int) -> dict:
+    """Build the dynamic music_intent for /start-session.
+
+    Static session.music_intent is the base. volume/mute are owned by the
+    adapter (when player.hardware_volume == false) and derived from MA.
+    """
+    intent: dict = dict(cfg["session"]["music_intent"])
+    vol = cfg["volume"]
+    if ma_percent == 0 and vol["zero_is_mute"]:
+        intent["mute"] = True
+    else:
+        intent["mute"] = False
+        intent["volume"] = ma_to_raw(ma_percent, vol)
+    return intent
+
+
+def cmd_start(cfg: dict, log: Log, state: State, lock: Lock) -> int:
+    with lock:
+        s = state.snapshot()
+        if s["pending_stop_token"]:
+            log.write("INFO", "start", f"cancelled pending stop token={s['pending_stop_token']}")
+            state.update(pending_stop_token=None)
+        if s["session_active"]:
+            log.write("INFO", "start", "session already active; reusing existing session")
+            return 0
+
+        ma = s["desired_ma_percent"]
+        if ma is None:
+            ma = cfg["volume"]["default_percent"]
+            log.write("INFO", "start", f"using default MA volume {ma} (no remembered value)")
+        else:
+            log.write("INFO", "start", f"using remembered MA volume {ma}")
+
+        intent = compute_music_intent(cfg, ma)
+        log.write("INFO", "start", f"computed music intent: {intent}")
+
+        status, body = http_post(
+            cfg, "/start-session",
+            {"name": cfg["session"]["name"], "intent": json.dumps(intent)},
+        )
+        if status != 200:
+            log.write("ERROR", "start", f"upstream /start-session failed HTTP={status} body={body!r}")
+            return 1
+
+        state.update(
+            session_active=True,
+            last_started_at=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        )
+        log.write("INFO", "start", "session_active=true (confirmed by upstream)")
+        return 0
+
+
+def cmd_stop(cfg: dict, log: Log, state: State, lock: Lock) -> int:
+    with lock:
+        s = state.snapshot()
+        if not s["session_active"]:
+            log.write("INFO", "stop", "no active session; nothing to schedule")
+            return 0
+
+        token = secrets.token_hex(16)
+        state.update(pending_stop_token=token)
+        log.write("INFO", "stop", f"cleanup scheduled in {cfg['session']['stop_debounce_seconds']}s token={token}")
+
+    # Spawn detached; the hook must return quickly.
+    spawn_cleanup(token, log)
+    return 0
+
+
+def spawn_cleanup(token: str, log: Log) -> None:
+    here = Path(__file__).resolve()
+    # setsid + nohup + close fds so the cleanup process survives our exit.
+    try:
+        subprocess.Popen(
+            [sys.executable, str(here), "cleanup", token],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+            close_fds=True,
+        )
+    except OSError as e:
+        log.write("ERROR", "stop", f"failed to spawn cleanup: {e}")
+
+
+def cmd_cleanup(cfg: dict, log: Log, state: State, lock: Lock, token: str) -> int:
+    delay = cfg["session"]["stop_debounce_seconds"]
+    if delay > 0:
+        time.sleep(delay)
+    with lock:
+        s = state.snapshot()
+        if s["pending_stop_token"] is None:
+            log.write("INFO", "cleanup", f"token={token} cancelled (no pending)")
+            return 0
+        if s["pending_stop_token"] != token:
+            log.write(
+                "INFO", "cleanup",
+                f"token={token} cancelled (current={s['pending_stop_token']})",
+            )
+            return 0
+
+        # Token matches. Run staged cleanup.
+        # Step 1: defence-in-depth mute (core also enforces staged restore).
+        status, body = http_post(cfg, "/send", {"intent": json.dumps({"mute": True})})
+        if status != 200:
+            log.write("ERROR", "cleanup", f"mute-first failed HTTP={status}; deferring")
+            return 1
+
+        # Step 2: stop session.
+        status, body = http_post(cfg, "/stop-session", {"name": cfg["session"]["name"]})
+        if status != 200:
+            log.write("ERROR", "cleanup", f"/stop-session failed HTTP={status}; deferring")
+            return 1
+
+        # Step 3: wait for the core to confirm restoration completed.
+        if not wait_for_restoration(cfg, timeout=30.0):
+            log.write(
+                "WARN", "cleanup",
+                "restoration-complete timeout; proceeding best-effort",
+            )
+
+        # Step 4: confirm completion and clear local session state.
+        state.update(session_active=False, pending_stop_token=None)
+        log.write("INFO", "cleanup", "session_active=false (restoration confirmed)")
+        return 0
+
+
+def wait_for_restoration(cfg: dict, timeout: float, interval: float = 0.2) -> bool:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        status, body = http_get(cfg, "/state", timeout=3.0)
+        if status == 200:
+            try:
+                data = json.loads(body)
+                sess = data.get("session", {})
+                if not sess.get("active") and not sess.get("restoring"):
+                    return True
+            except json.JSONDecodeError:
+                pass
+        time.sleep(interval)
+    return False
+
+
+def cmd_volume(cfg: dict, log: Log, state: State, lock: Lock, raw_value: str) -> int:
+    try:
+        ma = max(0, min(100, int(raw_value)))
+    except ValueError:
+        log.write("ERROR", "volume", f"non-integer MA value: {raw_value!r}")
+        return 2
+
+    with lock:
+        s = state.snapshot()
+        state.update(desired_ma_percent=ma)
+
+        if not s["session_active"]:
+            # INVARIANT: never contact/wake/change Yamaha while inactive.
+            if cfg["volume"]["remember_when_inactive"]:
+                log.write(
+                    "INFO", "volume",
+                    f"MA={ma} remembered while inactive (no Yamaha contact)",
+                )
+            else:
+                log.write(
+                    "INFO", "volume",
+                    f"MA={ma} discarded while inactive (no Yamaha contact)",
+                )
+                state.update(desired_ma_percent=None)
+            return 0
+
+        # Build dynamic volume/mute intent.
+        vol = cfg["volume"]
+        intent: dict = {}
+        if ma == 0 and vol["zero_is_mute"]:
+            intent["mute"] = True
+        else:
+            intent["mute"] = False
+            intent["volume"] = ma_to_raw(ma, vol)
+        log.write("INFO", "volume", f"MA={ma} -> intent={intent}")
+
+        status, body = http_post(cfg, "/send", {"intent": json.dumps(intent)})
+        if status != 200:
+            log.write("ERROR", "volume", f"upstream /send failed HTTP={status}; state preserved")
+            return 1
+        return 0
+
+
+def main(argv: list[str]) -> int:
+    if len(argv) < 2:
+        die("usage: yas207-sendspin {start|stop|cleanup TOKEN|volume N}", code=2)
+
+    rt = runtime_dir()
+    rt.mkdir(parents=True, exist_ok=True)
+    try:
+        os.chmod(rt, 0o700)
+    except OSError:
+        pass
+
+    log = Log(rt / "yas207-sendspin.log")
+    state = State(rt / "state.json")
+    lock = Lock(rt / "lock")
+
+    try:
+        cfg = load_config()
+    except SystemExit:
+        raise
+    except Exception as e:
+        log.write("ERROR", "init", f"config load failed: {e}")
+        return 2
+
+    action = argv[1]
+    try:
+        if action == "start":
+            return cmd_start(cfg, log, state, lock)
+        if action == "stop":
+            return cmd_stop(cfg, log, state, lock)
+        if action == "cleanup":
+            if len(argv) != 3:
+                die("usage: yas207-sendspin cleanup TOKEN", code=2)
+            return cmd_cleanup(cfg, log, state, lock, argv[2])
+        if action == "volume":
+            if len(argv) != 3:
+                die("usage: yas207-sendspin volume MA_PERCENT", code=2)
+            return cmd_volume(cfg, log, state, lock, argv[2])
+        die(f"unknown action: {action!r}", code=2)
+    except Exception as e:
+        log.write("ERROR", action, f"unhandled exception: {e}")
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))
