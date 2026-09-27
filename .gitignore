@@ -1,2 +1,5 @@
 .svn
 data
+__pycache__
+*.pyc
+*.pyo
