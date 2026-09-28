@@ -75,7 +75,8 @@ class YamahaSoundbarRemote
 		dimmer: "4078ba",
 
 		# status report (query, soundbar returns a message)
-		report_status: "0305"
+		report_status: "0305",
+		report_volume: "0312"
 	}.freeze
 
 	# Mapping of input values to names
@@ -116,6 +117,41 @@ class YamahaSoundbarRemote
 		bass_ext: true,
 		clearvoice: false,
 	}.freeze
+
+	# Keys applied for general (non-restore) intent enforcement. Order chosen
+	# for start-session semantics: input switches first so that subsequent
+	# volume/sound changes are made into a silent source.
+	APPLY_KEYS = [
+		:input, :volume, :subwoofer, :surround, :bass_ext, :clearvoice,
+		:mute, :power
+	].freeze
+
+	# Keys applied during stop-session restoration. Order is the staged-restore
+	# safety order: silence first (mute), then reduce volume to saved level,
+	# then sound character, then switch input (still muted, safe), then
+	# restore final mute state.
+	#
+	# NOTE: :input is intentionally NOT in this list. Input switching is
+	# handled by the dedicated :input phase below, which only runs once
+	# :volume AND :sound have positively converged to the saved state.
+	RESTORE_KEYS = [
+		:mute, :volume, :surround, :bass_ext, :clearvoice, :subwoofer
+	].freeze
+
+	# Staged restore phases.
+	# :mute     force and verify temporary mute
+	# :volume   restore volume transactionally, with bounded correction
+	# :sound    restore clearvoice / surround / bass_ext / subwoofer
+	# :input    restore input (only after :volume AND :sound verified)
+	# :final_mute restore saved mute value (after another volume check)
+	RESTORE_PHASES = [
+		:mute, :volume, :sound, :input, :final_mute
+	].freeze
+
+	# A distinct 0x12 reply is the completion barrier for volume operations.
+	# Try direct correction first, then home to the lower boundary if needed.
+	MAX_VOLUME_RESTORE_CORRECTIONS = 2
+	VOLUME_HOME_MARGIN = 5
 
 	# Load configuration from disk. Falls back to {} if no config file
 	# exists; this preserves upstream legacy behaviour.
@@ -167,14 +203,22 @@ class YamahaSoundbarRemote
 		@intent = {}
 		@session = nil
 		@restoring_session = false
+		@restore_requested = false
+		@deferred_final_mute = nil
 		@snapshot_path = File.join(@runtime_dir, 'controller', 'session.json')
 		@snapshot_recovered = false
+		@restore_phase = nil
+		@restore_phase_status_refreshed = false
+		@restore_volume_attempts = 0
+		@restore_volume_homed = false
+		@restore_error = nil
+		@restore_id = 0
 		FileUtils.mkdir_p(File.dirname(@snapshot_path))
 	end
 	attr_reader :device_state, :config, :runtime_dir, :rfcomm_device, :http_bind,
 		:http_port, :sync_timeout, :status_refresh, :manage_power,
 		:initial_intent_mode, :initial_intent_config, :session,
-		:restoring_session, :snapshot_path
+		:restoring_session, :snapshot_path, :restore_phase, :restore_error
 
 	# Handle packet received via serial.
 	#
@@ -270,13 +314,54 @@ class YamahaSoundbarRemote
 							STDERR.puts "! Terminating session '#{name}' while" +
 								" '#{@session.first}' active."
 						end
-						@intent.update(@session.last)
+						saved = @session.last
 						@session = nil
+						# Persist snapshot BEFORE we clear @intent, so a crash
+						# mid-restore still allows the next restart to recover.
+						persist_session_snapshot(name, saved)
+						# Capture the saved mute value BEFORE any mutation --
+						# the deferred-final-mute is restored later from this
+						# capture.
+						@deferred_final_mute = saved[:mute] if saved.key?(:mute)
+						# Strip :power from restore if not managing power.
+						restore_state = @manage_power ? saved : saved.reject { |k, _| k == :power }
+						@intent.update(restore_state)
+						# SAFETY INVARIANT: temporary mute BEFORE any other
+						# state change so the staged restore cannot blast TV
+						# audio at music-session volume.
+						@intent[:mute] = true
+						@restore_phase = :mute
+						@restore_phase_status_refreshed = false
+						@restore_volume_attempts = 0
+						@restore_volume_homed = false
+						@restore_error = nil
+						@restore_id += 1
+						@restoring_session = true
+						@restore_requested = false
+					else
+						@restore_requested = false
 					end
 				end
 				# and now enforce it
-				unless @intent.empty?
-					@intent = enforce_intent(@intent)
+				if @restoring_session && @restore_phase
+					unless @restore_phase == :failed
+						@intent = enforce_staged_restore(@intent, @device_state.dup)
+					end
+					if @restoring_session && @intent.empty? && @restore_phase.nil?
+						# Restore fully settled.
+						@restoring_session = false
+						delete_session_snapshot
+					end
+				elsif !@intent.empty?
+					keys = @restoring_session ? RESTORE_KEYS : APPLY_KEYS
+					@intent = enforce_intent(@intent, keys_to_enforce: keys)
+				end
+			when 0x12 # volume/mute reply to report_volume (03 12)
+				params = parse_volume_status(packet)
+				@device_state.update(params)
+				puts "+ VS: mute:#{params[:mute]},volume:#{params[:volume]}"
+				if @restoring_session && @restore_phase
+					@intent = handle_restore_volume_status(@intent, params)
 				end
 			else
 				puts "? Received: #{packet.inspect}" # FIXME
@@ -298,6 +383,13 @@ class YamahaSoundbarRemote
 		params
 	end
 
+	private def parse_volume_status(pkt)
+		{
+			mute: !pkt[1].zero?,
+			volume: pkt[2],
+		}
+	end
+
 	private def enqueue(command)
 		cmd = YamahaPacketCodec.encode(command)
 		@queue.push([Time.now, cmd])
@@ -312,7 +404,7 @@ class YamahaSoundbarRemote
 	end
 
 	# Enforce given intent and return whatever couldn't have been enforced.
-	private def enforce_intent(intent)
+	private def enforce_intent(intent, keys_to_enforce: APPLY_KEYS)
 		intent = intent.dup
 		retried = intent.delete(:enforce_retried)
 		device_state = @device_state.dup
@@ -340,10 +432,7 @@ class YamahaSoundbarRemote
 			enqueue(COMMANDS[:power_on])
 		end
 
-		# enforce individual keys
-		keys_to_enforce = [
-			:input, :volume, :subwoofer, :surround, :bass_ext, :clearvoice,
-			:mute, :power]
+		# Enforce individual keys in the provided order.
 		(keys_to_enforce & delta_keys).each do |k|
 			case k
 			when :input
@@ -381,6 +470,7 @@ class YamahaSoundbarRemote
 	# @param command [Array<Integer>, String] command understood by `YamahaPacketCodec.encode()`.
 	# @raise [RuntimeError] when device not ready
 	def send_raw(command)
+		ensure_not_restoring!
 		if @state == :synced
 			enqueue(command)
 		else
@@ -394,6 +484,7 @@ class YamahaSoundbarRemote
 	# @raise [RuntimeError] when device not ready
 	# @raise [ArgumentError] when the command is wrong
 	def send(command)
+		ensure_not_restoring!
 		if @state == :synced
 			if c = COMMANDS[command.to_sym]
 				enqueue(c)
@@ -413,6 +504,7 @@ class YamahaSoundbarRemote
 	# @raise [RuntimeError] when device not ready
 	# @raise [ArgumentError] when the intent is wrong
 	def start_session(name, intent)
+		ensure_not_restoring!
 		if @state == :synced
 			add_intent(parse_intent(intent).update({start_session: name}))
 		else
@@ -426,8 +518,15 @@ class YamahaSoundbarRemote
 	# @raise [RuntimeError] when device not ready
 	# @raise [ArgumentError] when the intent is wrong
 	def stop_session(name)
+		ensure_not_restoring!
 		if @state == :synced
-			add_intent({stop_session: name})
+			@restore_requested = true
+			begin
+				add_intent({stop_session: name})
+			rescue
+				@restore_requested = false
+				raise
+			end
 		else
 			raise RuntimeError, "device not ready"
 		end
@@ -439,10 +538,17 @@ class YamahaSoundbarRemote
 	# @raise [RuntimeError] when device not ready
 	# @raise [ArgumentError] when the intent is wrong
 	def send_intent(intent)
+		ensure_not_restoring!
 		if @state == :synced
 			add_intent(parse_intent(intent))
 		else
 			raise RuntimeError, "device not ready"
+		end
+	end
+
+	private def ensure_not_restoring!
+		if @restore_requested || @restoring_session
+			raise RuntimeError, "session restore in progress"
 		end
 	end
 
@@ -548,6 +654,265 @@ class YamahaSoundbarRemote
 	rescue => e
 		STDERR.puts "! Failed to recover session snapshot: #{e}"
 	end
+
+	# ---- staged session restore ----
+
+	# Dispatch to the current restore phase. Each phase is responsible for
+	# advancing @restore_phase once its verification criteria are met.
+	private def enforce_staged_restore(intent, device_state)
+		# Strip :power from intent unless we manage it.
+		intent.delete(:power) unless @manage_power
+
+		case @restore_phase
+		when :mute
+			enforce_restore_mute_phase(intent, device_state)
+		when :volume
+			enforce_restore_volume_phase(intent, device_state)
+		when :sound
+			enforce_restore_sound_phase(intent, device_state)
+		when :input
+			enforce_restore_input_phase(intent, device_state)
+		when :final_mute
+			enforce_restore_final_mute_phase(intent, device_state)
+		else
+			@restore_error = "unknown restore phase: #{@restore_phase}"
+			@restore_phase = :failed
+			STDERR.puts "! #{@restore_error}; input remains unchanged and snapshot is preserved."
+			intent
+		end
+	end
+
+	# Phase :mute -- force temporary mute on and verify.
+	#
+	# Forces mute_on, then queues a fresh status readback so the next 0x05
+	# reply confirms whether the device actually muted. Bounded retry.
+	private def enforce_restore_mute_phase(intent, device_state)
+		unless device_state[:mute]
+			unless @restore_phase_status_refreshed
+				@restore_phase_status_refreshed = true
+				enqueue(COMMANDS[:mute_on])
+				enqueue(COMMANDS[:report_status])
+				return intent.update({enforce_retried: true})
+			end
+
+			@restore_volume_attempts += 1
+			if @restore_volume_attempts > MAX_VOLUME_RESTORE_CORRECTIONS
+				fail_restore('temporary mute not confirmed')
+				return intent
+			end
+			enqueue(COMMANDS[:mute_on])
+			enqueue(COMMANDS[:report_status])
+			return intent.update({enforce_retried: true})
+		end
+
+		# Mute confirmed; advance to :volume.
+		@restore_phase = :volume
+		@restore_phase_status_refreshed = false
+		@restore_volume_attempts = 0
+		@restore_volume_homed = false
+		enqueue(COMMANDS[:report_status])
+		intent.update({enforce_retried: true})
+	end
+
+	# Phase :volume -- drive volume to the saved value, with bounded
+	# correction. The 0x12 reply is the completion barrier.
+	private def enforce_restore_volume_phase(intent, device_state)
+		target = intent[:volume]
+		return advance_restore_to_sound(intent) unless target
+
+		# If we already see the saved volume + mute, advance.
+		if device_state[:volume] == target && device_state[:mute]
+			return advance_restore_to_sound(intent)
+		end
+
+		# Re-mute defensively (volume_up/down clear mute on real hardware)
+		# before any volume step.
+		enqueue(COMMANDS[:mute_on])
+
+		# If the volume matches target but mute is lost, re-mute and re-check.
+		if device_state[:volume] == target
+			enqueue(COMMANDS[:report_status])
+			return intent.update({enforce_retried: true})
+		end
+
+		delta = target - device_state[:volume]
+		command = delta.negative? ? :volume_down : :volume_up
+		delta.abs.times { enqueue(COMMANDS[command]) }
+		# Always reassert mute after the volume walk, then ask for a
+		# fresh volume/mute readback (0x12).
+		enqueue(COMMANDS[:mute_on])
+		enqueue(COMMANDS[:report_volume])
+		intent.update({enforce_retried: true})
+	end
+
+	# Phase :sound -- restore clearvoice / surround / bass_ext / subwoofer.
+	private def enforce_restore_sound_phase(intent, device_state)
+		sound_keys = [:clearvoice, :surround, :bass_ext, :subwoofer]
+		delta_sound_keys = intent.keys & sound_keys
+		actual_delta = delta_sound_keys.reject { |k| device_state[k] == intent[k] }
+
+		if actual_delta.empty?
+			@restore_phase_status_refreshed = false
+			@restore_phase = :input
+			enqueue(COMMANDS[:report_status])
+			return intent.update({enforce_retried: true})
+		end
+
+		# Force a fresh status readback on the first pass of this phase.
+		unless @restore_phase_status_refreshed
+			@restore_phase_status_refreshed = true
+			enqueue(COMMANDS[:report_status])
+			return intent.update({enforce_retried: true})
+		end
+
+		(RESTORE_KEYS & actual_delta).each do |k|
+			case k
+			when :subwoofer
+				d = intent[:subwoofer] - device_state[:subwoofer]
+				(d.abs / 4).times {
+					enqueue(COMMANDS[d < 0 ? :subwoofer_down : :subwoofer_up]) }
+			when :surround
+				enqueue(COMMANDS[('set_surround_' + intent[:surround].to_s).to_sym])
+			when :clearvoice, :bass_ext
+				enqueue(COMMANDS[(k.to_s + (intent[k] ? '_on' : '_off')).to_sym])
+			end
+		end
+		enqueue(COMMANDS[:report_status])
+		intent.update({enforce_retried: true})
+	end
+
+	# Phase :input -- restore the input. Only runs after :volume AND :sound
+	# have converged. If saved input already matches current input, advance.
+	private def enforce_restore_input_phase(intent, device_state)
+		unless @restore_phase_status_refreshed
+			@restore_phase_status_refreshed = true
+			enqueue(COMMANDS[:report_status])
+			return intent.update({enforce_retried: true})
+		end
+
+		if device_state[:input] == intent[:input]
+			@restore_phase = :final_mute
+			@restore_phase_status_refreshed = false
+			enqueue(COMMANDS[:report_volume])
+			return intent
+		end
+
+		enqueue(COMMANDS[('set_input_' + intent[:input].to_s).to_sym])
+		enqueue(COMMANDS[:report_status])
+		intent.update({enforce_retried: true})
+	end
+
+	# Phase :final_mute -- apply the deferred final mute value and verify.
+	private def enforce_restore_final_mute_phase(intent, device_state)
+		# We rely on the 0x12 reply to act, since the input switch may have
+		# just changed the device state. Force a fresh status readback here.
+		unless @restore_phase_status_refreshed
+			@restore_phase_status_refreshed = true
+			enqueue(COMMANDS[:report_volume])
+			return intent.update({enforce_retried: true})
+		end
+
+		# The actual decision is made in handle_restore_volume_status once
+		# the 0x12 reply arrives, since volume/mute are the relevant fields.
+		intent
+	end
+
+	# Handle 0x12 (volume/mute) reply during staged restore.
+	private def handle_restore_volume_status(intent, status)
+		target = intent[:volume]
+		return advance_restore_to_sound(intent) unless target
+
+		if @restore_phase == :volume
+			# First attempt: direct correction worked.
+			if status[:volume] == target && status[:mute]
+				return advance_restore_to_sound(intent)
+			end
+
+			# Volume correct but mute lost -- re-mute and ask again.
+			if status[:volume] == target
+				@restore_volume_attempts += 1
+				if @restore_volume_attempts > MAX_VOLUME_RESTORE_CORRECTIONS
+					return fail_restore("temporary mute not retained: volume=#{status[:volume]} mute=#{status[:mute]}")
+				end
+				enqueue(COMMANDS[:mute_on])
+				enqueue(COMMANDS[:report_volume])
+				return intent
+			end
+
+			# Volume not converged. Try direct correction up to N times.
+			@restore_volume_attempts += 1
+			if @restore_volume_attempts <= MAX_VOLUME_RESTORE_CORRECTIONS
+				STDERR.puts "! Correcting volume mismatch: target=#{target} actual=#{status[:volume]} attempt=#{@restore_volume_attempts}"
+				enqueue(COMMANDS[:mute_on])
+				delta = target - status[:volume]
+				command = delta.negative? ? :volume_down : :volume_up
+				delta.abs.times { enqueue(COMMANDS[command]) }
+				enqueue(COMMANDS[:mute_on])
+				enqueue(COMMANDS[:report_volume])
+				return intent
+			end
+
+			# Direct correction failed -- try homing to lower boundary first.
+			unless @restore_volume_homed
+				@restore_volume_homed = true
+				STDERR.puts "! Direct volume correction failed; homing to raw 0 before restoring #{target}."
+				# Drive to lower bound with margin, then back up.
+				(VOLUME_RANGE.max + VOLUME_HOME_MARGIN).times { enqueue(COMMANDS[:volume_down]) }
+				enqueue(COMMANDS[:mute_on])
+				target.times { enqueue(COMMANDS[:volume_up]) }
+				enqueue(COMMANDS[:mute_on])
+				enqueue(COMMANDS[:report_volume])
+				return intent
+			end
+
+			return fail_restore("volume mismatch after homing: target=#{target} actual=#{status[:volume]}")
+		end
+
+		if @restore_phase == :final_mute
+			final_mute = @deferred_final_mute
+			if status[:volume] != target
+				return fail_restore("volume changed during input restoration: target=#{target} actual=#{status[:volume]}")
+			end
+
+			# Determine whether we need to apply the deferred final mute.
+			unless final_mute.nil?
+				if status[:mute] != final_mute
+					@restore_volume_attempts += 1
+					if @restore_volume_attempts > MAX_VOLUME_RESTORE_CORRECTIONS
+						return fail_restore("final mute not applied: target=#{final_mute} actual=#{status[:mute]}")
+					end
+					enqueue(COMMANDS[final_mute ? :mute_on : :mute_off])
+					enqueue(COMMANDS[:report_volume])
+					return intent
+				end
+			end
+
+			# Verification complete -- end restore.
+			@restore_phase = nil
+			@restoring_session = false
+			@restore_error = nil
+			@deferred_final_mute = nil
+			delete_session_snapshot
+			return {}
+		end
+
+		intent
+	end
+
+	private def advance_restore_to_sound(intent)
+		@restore_phase = :sound
+		@restore_phase_status_refreshed = false
+		@restore_volume_attempts = 0
+		enqueue(COMMANDS[:report_status])
+		intent
+	end
+
+	private def fail_restore(reason)
+		@restore_error = reason
+		@restore_phase = :failed
+		STDERR.puts "! Restore failed; input will not be changed further and snapshot is preserved: #{reason}"
+		{}
+	end
 end
 
 if __FILE__ == $0
@@ -647,17 +1012,19 @@ if __FILE__ == $0
 		end
 
 		# /state returns a JSON snapshot of current device state plus the
-		# session model (name, active, restoring). Players can use it to
-		# positively confirm session-restore completion before they tear
-		# down their own resources.
+		# session model (name, active, restoring, current phase). Players
+		# can use it to positively confirm session-restore completion
+		# before they tear down their own resources.
 		s.mount_proc("/state") do |req, res|
 			res['Content-Type'] = 'application/json; charset=utf-8'
 			res.body = JSON.pretty_generate({
 				'device_state' => ysr.device_state,
 				'session' => {
-					'name'      => ysr.session ? ysr.session.first : nil,
-					'active'    => !ysr.session.nil?,
-					'restoring' => ysr.restoring_session,
+					'name'          => ysr.session ? ysr.session.first : nil,
+					'active'        => !ysr.session.nil?,
+					'restoring'     => ysr.restoring_session,
+					'restore_phase' => ysr.restore_phase,
+					'restore_error' => ysr.restore_error,
 				},
 			})
 		end
