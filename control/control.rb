@@ -148,6 +148,13 @@ class YamahaSoundbarRemote
 		:mute, :volume, :surround, :bass_ext, :clearvoice, :subwoofer
 	].freeze
 
+	# Control-flow markers consumed by the 0x05 handler chain, NOT device
+	# state. enforce_intent must keep them out of the delta and hand them
+	# back untouched: no enforce pass (zero diff, loop breaker, or
+	# powered-off deferral) may silently drop a pending lifecycle
+	# transition.
+	MARKER_KEYS = [:initial, :start_session, :stop_session].freeze
+
 	# Staged restore phases.
 	# :mute     force and verify temporary mute
 	# :volume   restore volume transactionally, with bounded correction
@@ -235,8 +242,16 @@ class YamahaSoundbarRemote
 			@initial_intent_mode = :present_empty
 			@initial_intent_config = nil
 		else
+			raw_intent = ctrl['initial_intent']
+			unless raw_intent.is_a?(Hash)
+				raise ArgumentError,
+					"controller.initial_intent must be a hash of supported intent keys"
+			end
+			# Validate + normalize at load time (symbol keys, checked
+			# domains); an invalid intent raises ArgumentError, matching
+			# the idle_input_policy failure mode.
 			@initial_intent_mode = :configured
-			@initial_intent_config = ctrl['initial_intent']
+			@initial_intent_config = parse_intent(raw_intent)
 		end
 
 		# Post-init / SPP-reconnect idle input sanitization. Disabled (nil)
@@ -404,18 +419,35 @@ class YamahaSoundbarRemote
 				# (config-gated; see sanitize_idle_input).
 				sanitize_idle_input
 
-				if @intent[:initial]
+			if @intent[:initial]
+				if @session || @restoring_session
+					# A live or recovered session (or an in-flight staged
+					# restore) takes precedence over the startup initial
+					# intent: it must not overwrite the device state that
+					# the session snapshot / staged restore owns. Drop the
+					# :initial marker without merging the source intent;
+					# any other pending intents remain.
+					rest_of_intent = @intent.dup
+					rest_of_intent.delete(:initial)
+					@intent = rest_of_intent
+				else
 					# Initial-intent handling. Tri-state picks the source intent.
 					intent = (@initial_intent_mode == :configured ? @initial_intent_config : INITIAL_INTENT).dup
-					if @device_state[:power] && @device_state[:input] == :bluetooth
-						# we probably just woke up the device → put it back to sleep @ HDMI
+					if @initial_intent_mode == :absent &&
+						@device_state[:power] && @device_state[:input] == :bluetooth
+						# Legacy mode only: we probably just woke up the device
+						# via SPP -> put it back to sleep at HDMI. A configured
+						# initial_intent is applied exactly as validated at load
+						# time (no input/power side effects); idle_input_policy
+						# owns idle-input correction in that mode.
 						intent.update({input: :hdmi, power: false})
 					end
 					rest_of_intent = @intent.dup
 					rest_of_intent.delete(:initial)
 					intent.update(rest_of_intent)
 					@intent = intent
-				elsif @intent[:start_session]
+				end
+			elsif @intent[:start_session]
 					name = @intent.delete(:start_session)
 					if @session
 						# @session was pre-created by start_session BEFORE the
@@ -576,19 +608,32 @@ class YamahaSoundbarRemote
 	private def enforce_intent(intent, keys_to_enforce: APPLY_KEYS)
 		intent = intent.dup
 		retried = intent.delete(:enforce_retried)
+		# Lifecycle markers belong to the 0x05 handler chain; keep them out
+		# of enforcement and return them untouched on every path.
+		markers = intent.select { |k, _| MARKER_KEYS.include?(k) }
+		enforceable = intent.reject { |k, _| MARKER_KEYS.include?(k) }
 		device_state = @device_state.dup
 
 		# If power is not managed, strip :power from intent before computing deltas.
-		intent.delete(:power) unless @manage_power
+		enforceable.delete(:power) unless @manage_power
 
-		delta_keys = intent.keys.reduce([]) { |m, x| m << x unless device_state[x] == intent[x]; m }
+		delta_keys = enforceable.keys.reduce([]) { |m, x| m << x unless device_state[x] == enforceable[x]; m }
 
-		return {} if delta_keys.empty? # zero diff → stable state reached
+		return markers if delta_keys.empty? # zero diff → stable state reached
 		# also zero diff (mute doesn't work when powered off) >>
-		return {} if delta_keys == [:mute] && device_state[:power] == false
+		return markers if delta_keys == [:mute] && device_state[:power] == false
+
+		# A device that is off and that we are not responsible for powering
+		# on ignores sound-setting commands; enqueuing them is pointless.
+		# Enqueue nothing and keep the intent (fresh, without the
+		# enforce_retried marker) so it converges once the device reports
+		# power=true. (manage_power=true keeps the upstream auto-power-on
+		# path below, unchanged.)
+		return enforceable.merge(markers) if !@manage_power && !device_state[:power]
+
 		if retried
 			STDERR.puts "~ enforce_intent: loop breaker: #{intent.inspect} on #{device_state}, delta: #{delta_keys}" if $VERBOSE || $DEBUG
-			return {}
+			return markers
 		end
 
 		# Pathological case: device is off but other intents exist. Upstream
@@ -597,11 +642,11 @@ class YamahaSoundbarRemote
 			enqueue(COMMANDS[:power_on]) # turn on
 			device_state[:power] = true # mark it's on
 			delta_keys << :power unless delta_keys.include?(:power)
-			intent[:power] ||= false # force off (unless intended otherwise)
+			enforceable[:power] ||= false # force off (unless intended otherwise)
 		end
 
 		# First power on (if needed); also gated on manage_power.
-		if @manage_power && intent[:power] && !device_state[:power]
+		if @manage_power && enforceable[:power] && !device_state[:power]
 			enqueue(COMMANDS[:power_on])
 		end
 
@@ -609,20 +654,20 @@ class YamahaSoundbarRemote
 		(keys_to_enforce & delta_keys).each do |k|
 			case k
 			when :input
-				enqueue(COMMANDS[('set_input_' + intent[k].to_s).to_sym])
+				enqueue(COMMANDS[('set_input_' + enforceable[k].to_s).to_sym])
 			when :volume
-				delta = intent[:volume] - device_state[:volume]
+				delta = enforceable[:volume] - device_state[:volume]
 				delta.abs.times {
 					enqueue(COMMANDS[delta < 0 ? :volume_down : :volume_up]) }
 			when :subwoofer
-				delta = intent[:subwoofer] - device_state[:subwoofer]
+				delta = enforceable[:subwoofer] - device_state[:subwoofer]
 				(delta.abs / 4).times {
 					enqueue(
 						COMMANDS[delta < 0 ? :subwoofer_down : :subwoofer_up]) }
 			when :surround
-				enqueue(COMMANDS[('set_surround_' + intent[k].to_s).to_sym])
+				enqueue(COMMANDS[('set_surround_' + enforceable[k].to_s).to_sym])
 			when :mute, :bass_ext, :clearvoice, :power
-				enqueue(COMMANDS[(k.to_s + (intent[k] ? '_on' : '_off')).to_sym])
+				enqueue(COMMANDS[(k.to_s + (enforceable[k] ? '_on' : '_off')).to_sym])
 			else
 				STDERR.puts "! enforce_intent for unimplemented key: #{k}"
 			end
@@ -630,7 +675,7 @@ class YamahaSoundbarRemote
 
 		# Had a diff; request one verification round without re-emitting the batch.
 		enqueue(COMMANDS[:report_status])
-		intent.update({enforce_retried: true})
+		enforceable.update({enforce_retried: true}).merge(markers)
 	end
 
 	# Send raw command to device -- called by end users (if they speak raw).
@@ -1304,6 +1349,18 @@ class YamahaSoundbarRemote
 		return unless name && saved
 		# Symbolize keys for parity with @device_state.
 		saved_sym = saved.each_with_object({}) { |(k, v), h| h[k.to_sym] = v }
+		# A JSON round-trip leaves the enum values (input, surround) as
+		# strings while the live device_state uses symbols. Normalize them
+		# for parity, or a recovered staged restore would delta forever
+		# against exact-equality comparisons and never converge.
+		if saved_sym[:input]
+			input = saved_sym[:input].to_sym
+			saved_sym[:input] = input if INPUT_NAMES.values.include?(input)
+		end
+		if saved_sym[:surround]
+			surround = saved_sym[:surround].to_sym
+			saved_sym[:surround] = surround if SURROUND_NAMES.values.include?(surround)
+		end
 		# session_powered_on / power_on_completed default to false on old
 		# snapshots (backward-compatible: an old snapshot without these
 		# fields will never trigger a final power-off at restore time).
