@@ -1,27 +1,28 @@
 [Unit]
 Description=Bind /dev/rfcomm0 to Yamaha YAS-207 (BT SPP)
 Documentation=https://github.com/fortiko/yamaha-yas-207
-After=bluetooth.service
-Wants=bluetooth.service
+After=bluetooth.service bluetooth.target
+Wants=bluetooth.service bluetooth.target
 
-# Tune the MAC and channel to your YAS-207. The default values are
-# the verified configuration for our installation:
-#   MAC:    02:0A:0B:0C:0D:0E
+# Verified for the example installation:
+#   MAC:     02:0A:0B:0C:0D:0E
 #   channel: 1 (SPP)
+# Override at install time by editing the Environment= lines below
+# or by dropping a drop-in at /etc/systemd/system/yas207-rfcomm-bind.service.d/.
 Environment=YAS207_BT_MAC=02:0A:0B:0C:0D:0E
 Environment=YAS207_RFCOMM_CHANNEL=1
 Environment=YAS207_RFCOMM_DEV=/dev/rfcomm0
 
 [Service]
 Type=oneshot
-ExecStart=/usr/bin/rfcomm bind ${YAS207_RFCOMM_DEV} ${YAS207_BT_MAC} ${YAS207_RFCOMM_CHANNEL}
 RemainAfterExit=yes
-# If the bind fails (e.g., MAC not yet reachable), retry up to 5 times
-# with a 3-second delay. The total wait is ~15 seconds.
+ExecStart=/usr/bin/rfcomm bind ${YAS207_RFCOMM_DEV} ${YAS207_BT_MAC} ${YAS207_RFCOMM_CHANNEL}
+# The bind may transiently fail if the YAS has just powered on or the
+# BlueZ discovery cache is stale; retry briefly.
 Restart=on-failure
 RestartSec=3
-StartLimitBurst=5
-StartLimitIntervalSec=30
+StartLimitBurst=10
+StartLimitIntervalSec=60
 
 [Install]
-WantedBy=multi-user.target
+WantedBy=bluetooth.target

@@ -1,10 +1,9 @@
 [Unit]
 Description=Yamaha YAS-207 SPP controller (yas207)
 Documentation=https://github.com/fortiko/yamaha-yas-207
-# We want the controller up after Bluetooth is available and after
-# the rfcomm binding has been established. We do NOT Require it: the
-# controller's serial worker will retry on Errno::EIO and the
-# service-level Restart= will recover from transient rfcomm drops.
+# Start once Bluetooth is up AND the rfcomm bind has been performed.
+# We do not Require the bind unit: the controller's serial worker retries
+# on Errno::EIO and the unit-level Restart= recovers from transient drops.
 After=bluetooth.target yas207-rfcomm-bind.service
 Wants=bluetooth.target
 
@@ -12,25 +11,23 @@ Wants=bluetooth.target
 Type=simple
 WorkingDirectory=/home/yas207/src/yamaha-yas-207
 Environment=YAS207_CONFIG=/home/yas207/.config/yas207/controller.json
-Environment=YAS207_RUNTIME_DIR=/run/user/%U/yas207
-# Ruby 3.3 from Debian package
+# Runtime dir is /run/user/<euid>/yas207 (resolved by the controller
+# itself from Process.euid); no override required here.
 ExecStart=/usr/bin/ruby control/control.rb
 Restart=always
 RestartSec=5
-# Give the service a moment to settle before systemd considers it failed
 TimeoutStartSec=30
 
-# Hardening (minimal — controller opens /dev/rfcomm0 and creates
-# files in /run/user/1000/yas207)
+# Hardening: controller opens /dev/rfcomm0 and writes only under
+# /run/user/<euid>/yas207/.
 NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=strict
 ProtectHome=read-only
-# /dev/rfcomm0 must remain accessible
 DeviceAllow=/dev/rfcomm0 rw
-# /run/user/1000 must be writable
-RuntimeDirectory=yas207
-RuntimeDirectoryMode=0700
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+RestrictNamespaces=true
+RestrictRealtime=true
 
 StandardOutput=journal
 StandardError=journal

@@ -1,32 +1,24 @@
 [Unit]
 Description=Sendspin daemon (yas207) with YAS-207 hooks
 Documentation=https://github.com/fortiko/yamaha-yas-207
-# Sendspin must start after the controller is up so that the adapter
-# can talk to the controller on 127.0.0.1:8000.
+# Sendspin must come up after the controller is reachable on 127.0.0.1:8000.
 After=yas207-controller.service
 Wants=yas207-controller.service
 
 [Service]
 Type=simple
-# Use the dedicated sendspin venv's python
 Environment=PATH=/opt/sendspin/bin:/usr/local/bin:/usr/bin:/bin
-ExecStart=/opt/sendspin/bin/sendspin daemon \
-  --name "Example Room" \
-  --interface 192.0.2.135 \
-  --audio-device "Example ALSA Device" \
-  --audio-format flac:48000:16:2 \
-  --hardware-volume false \
-  --hook-start      /usr/local/sbin/yas207/yas207-sendspin start \
-  --hook-stop       /usr/local/sbin/yas207/yas207-sendspin stop \
-  --hook-set-volume /usr/local/sbin/yas207/yas207-sendspin volume \
-  --log-level INFO
+ExecStart=/opt/sendspin/bin/sendspin daemon --name "Example Room" --interface 192.0.2.135 --audio-device "Example ALSA Device" --audio-format flac:48000:16:2 --hardware-volume false --hook-start /usr/local/sbin/yas207/yas207-sendspin start --hook-stop /usr/local/sbin/yas207/yas207-sendspin stop --hook-set-volume /usr/local/sbin/yas207/yas207-sendspin volume --log-level INFO --disable-mpris
 Restart=always
 RestartSec=5
 TimeoutStartSec=30
 
-# Runtime dir created by the controller service; we use it for our
-# own state too.
-RuntimeDirectory=yas207
+# The runtime directory under /run/user/<euid>/yas207/ is created and
+# owned by yas207 via the controller; Sendspin inherits that ownership.
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
 
 StandardOutput=journal
 StandardError=journal

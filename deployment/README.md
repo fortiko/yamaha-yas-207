@@ -1,81 +1,85 @@
 # Deployment
 
 This directory holds generic systemd unit files for production
-persistence of the YAS-207 controller stack on the Pi.
-
-These are **templates** — copy to the correct systemd location on
-the Pi and edit the placeholders to match your installation.
+persistence of the YAS-207 controller stack on the Pi. These are
+**templates** — copy to the right systemd location on the Pi, run
+`systemctl daemon-reload`, and `enable --now` the units.
 
 ## Files
 
-* `systemd/yas207-rfcomm-bind.service` — **system** unit (root). Runs
-  once at boot to bind `/dev/rfcomm0` to the YAS-207 Bluetooth SPP
-  channel. Required because `rfcomm bind` needs `CAP_NET_ADMIN` and
-  must run before any user process tries to open `/dev/rfcomm0`.
+* `systemd/yas207-rfcomm-bind.service` — **system** unit (root).
+  Runs once at boot to bind `/dev/rfcomm0` to the YAS-207 Bluetooth
+  SPP channel. Required because `rfcomm bind` needs `CAP_NET_ADMIN`
+  and the bound device node must exist before the user controller
+  tries to open it.
 
 * `systemd/yas207-controller.service` — **user** unit (yas207). Runs
   the Ruby controller continuously. Restarts on failure. Holds the
-  SPP session; Sendspin hooks invoke the adapter, the adapter
-  talks to this controller over HTTP at `127.0.0.1:8000`.
+  SPP session; Sendspin hooks invoke the adapter, which talks to
+  this controller over HTTP at `127.0.0.1:8000`.
 
-* `systemd/sendspin.service` — **user** unit (yas207). Example Sendspin
-  daemon invocation with the three hooks wired to
-  `yas207-sendspin`. Adjust the audio-device selection for your
-  Pi's actual PortAudio enumeration.
-
-## Runtime directory
-
-The runtime directory `/run/user/<euid>/yas207/` is created by the
-controller service on first start (mode 0700, owned by yas207).
-It is part of the user systemd runtime (`/run/user/<uid>`), which
-is created and managed by `systemd --user` automatically when
-`loginctl enable-linger <user>` has been set.
-
-## Install steps
-
-```
-# yas207: enable lingering so user services run at boot
-sudo loginctl enable-linger yas207
-
-# root: install the rfcomm bind service
-sudo cp deployment/systemd/yas207-rfcomm-bind.service /etc/systemd/system/
-sudo systemctl daemon-reload
-sudo systemctl enable yas207-rfcomm-bind.service
-
-# yas207: install user services
-mkdir -p ~/.config/systemd/user
-cp deployment/systemd/yas207-controller.service ~/.config/systemd/user/
-cp deployment/systemd/sendspin.service ~/.config/systemd/user/
-systemctl --user daemon-reload
-systemctl --user enable yas207-controller.service sendspin.service
-```
-
-## Audio-device selection
-
-The `sendspin.service` example uses `--audio-device "Example ALSA
-Headphones"` (durable name). `sendspin daemon --help` accepts
-either a device name prefix or a numeric index. For production,
-prefer the name.
-
-If the durable name does not resolve at start time, Sendspin will
-fail to open the device. Run `sendspin audio-devices list` once
-from the target user to confirm.
+* `systemd/sendspin.service` — **user** unit (yas207). Headless Sendspin
+  daemon wired to the three YAS-207 hooks. Uses `--audio-device
+  "Example ALSA Device"` (durable name; not a numeric index) and
+  `--disable-mpris`.
 
 ## Boot-time ordering
 
 ```
 bluetooth.service
-  -> yas207-rfcomm-bind.service (one-shot, waits for BT)
-  -> yas207-controller.service (user, persistent)
-  -> sendspin.service (user, persistent)
+  └─► yas207-rfcomm-bind.service   (system, oneshot, RemainAfterExit=yes)
+        └─► yas207-controller.service  (user, simple)
+              └─► sendspin.service        (user, simple)
 ```
+
+## Install steps
+
+```
+# 1. yas207: enable lingering so user services come up at boot without
+#    an interactive login.
+sudo loginctl enable-linger yas207
+
+# 2. root: install the rfcomm bind service.
+sudo cp deployment/systemd/yas207-rfcomm-bind.service /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now yas207-rfcomm-bind.service
+# Verify:
+rfcomm show 0
+# Expected: "rfcomm0: 02:0A:0B:0C:0D:0E channel 1 connected [tty-attached]"
+
+# 3. yas207: install user services.
+mkdir -p ~/.config/systemd/user
+cp deployment/systemd/yas207-controller.service ~/.config/systemd/user/
+cp deployment/systemd/sendspin.service        ~/.config/systemd/user/
+systemctl --user daemon-reload
+systemctl --user enable --now yas207-controller.service sendspin.service
+
+# 4. Verify
+systemctl --user status yas207-controller.service sendspin.service
+curl -fsS http://127.0.0.1:8000/state | jq .
+journalctl --user -u yas207-controller.service -f
+```
+
+## Runtime directory
+
+The runtime directory `/run/user/<euid>/yas207/` is created and
+owned by `yas207` on first controller start (`FileUtils.mkdir_p` with
+mode 0700 inside `control/control.rb`). The directory lives under
+the per-user systemd runtime path, which `systemd --user` manages
+automatically once `loginctl enable-linger yas207` is in place.
+
+Do NOT set `RuntimeDirectory=yas207` in either user unit — that would
+have systemd manage the directory as root and break `yas207`'s writes.
 
 ## Failure / recovery
 
 * The controller's serial worker retries on `Errno::EIO` (transient
-  SPP drop). The user systemd unit restarts the whole controller
-  if it exits.
+  SPP drop) and resumes an in-flight restore after a reconnect.
+  `systemctl --user status yas207-controller.service` shows the
+  live state and `journalctl --user -u yas207-controller.service`
+  shows the protocol trace.
 * If the BT link to the YAS-207 is lost AND the rfcomm binding is
-  released, a manual `sudo rfcomm bind 0 <MAC> 1` is required.
-  Future improvement: a udev rule that rebinds when the BT device
-  reappears.
+  released, `systemctl restart yas207-rfcomm-bind.service` re-binds.
+* The controller's snapshot is preserved on failure. After any
+  crash, the next `/start-session`/`/stop-session` cycle replays the
+  pending restore from the snapshot.
