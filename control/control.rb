@@ -166,10 +166,15 @@ class YamahaSoundbarRemote
 		@state = :initial
 		@intent = {}
 		@session = nil
+		@restoring_session = false
+		@snapshot_path = File.join(@runtime_dir, 'controller', 'session.json')
+		@snapshot_recovered = false
+		FileUtils.mkdir_p(File.dirname(@snapshot_path))
 	end
 	attr_reader :device_state, :config, :runtime_dir, :rfcomm_device, :http_bind,
 		:http_port, :sync_timeout, :status_refresh, :manage_power,
-		:initial_intent_mode, :initial_intent_config
+		:initial_intent_mode, :initial_intent_config, :session,
+		:restoring_session, :snapshot_path
 
 	# Handle packet received via serial.
 	#
@@ -223,6 +228,16 @@ class YamahaSoundbarRemote
 				params = parse_device_status(packet)
 				puts "+ DS: #{params.map { |k,v| "#{k}:#{v}" }.join(',')}"
 				@device_state = params
+
+				# Crash recovery: after the first device-state observation,
+				# attempt to restore the persistent session snapshot if one
+				# exists. We do this exactly once and only if no live session
+				# is currently active.
+				if !@snapshot_recovered
+					@snapshot_recovered = true
+					recover_session_snapshot
+				end
+
 				if @intent[:initial]
 					# Initial-intent handling. Tri-state picks the source intent.
 					intent = (@initial_intent_mode == :configured ? @initial_intent_config : INITIAL_INTENT).dup
@@ -246,6 +261,7 @@ class YamahaSoundbarRemote
 						puts "+ Starting a new session '#{name}' with" +
 							" intent: #{@intent.inspect}."
 						@session = [name, @device_state.dup]
+						persist_session_snapshot(name, @session.last)
 					end
 				elsif @intent[:stop_session]
 					name = @intent.delete(:stop_session)
@@ -498,6 +514,39 @@ class YamahaSoundbarRemote
 		payload
 	rescue ThreadError
 		nil
+	end
+
+	# ---- session snapshot persistence (process-crash recovery) ----
+
+	private def persist_session_snapshot(name, saved)
+		File.write(@snapshot_path, JSON.pretty_generate({
+			'name' => name,
+			'saved_state' => saved,
+			'captured_at' => Time.now.utc.iso8601,
+		}))
+		File.chmod(0600, @snapshot_path)
+	rescue => e
+		STDERR.puts "! Failed to persist session snapshot: #{e}"
+	end
+
+	private def delete_session_snapshot
+		File.unlink(@snapshot_path) if File.exist?(@snapshot_path)
+	rescue => e
+		STDERR.puts "! Failed to delete session snapshot: #{e}"
+	end
+
+	private def recover_session_snapshot
+		return unless File.exist?(@snapshot_path)
+		data = JSON.parse(File.read(@snapshot_path))
+		name = data['name']
+		saved = data['saved_state']
+		return unless name && saved
+		# Symbolize keys for parity with @device_state.
+		saved_sym = saved.each_with_object({}) { |(k, v), h| h[k.to_sym] = v }
+		@session = [name, saved_sym]
+		puts "! Recovered session from snapshot: name=#{name}, saved=#{saved_sym.inspect}"
+	rescue => e
+		STDERR.puts "! Failed to recover session snapshot: #{e}"
 	end
 end
 
