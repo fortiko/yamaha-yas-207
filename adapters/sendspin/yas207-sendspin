@@ -2,17 +2,27 @@
 """Sendspin adapter for the Yamaha YAS-207 controller.
 
 This is the SINGLE entry point that Sendspin's --hook-start, --hook-stop
-and --hook-set-volume directives all invoke. Sendspin's daemon
-(`sendspin/hooks.py`) runs each hook via `asyncio.create_subprocess_shell`
-and injects the event name through the `SENDSPIN_EVENT` environment
-variable; positional arguments are not appended. For the
-set-volume hook, Sendspin additionally passes the MA percent value
-as the final positional argument, which this adapter reads from
-`sys.argv[1]`. Dispatch:
+and --hook-set-volume directives all invoke. Sendspin uses two distinct
+invocation mechanisms, so the adapter recognises three hook contracts:
 
-  SENDSPIN_EVENT=start                  -> start-session
-  SENDSPIN_EVENT=stop                   -> schedule stop (cleanup handles /stop-session)
-  SENDSPIN_EVENT=set-volume VOLUME_MA   -> apply MA volume
+  1. Stream start (`--hook-start`):
+     `asyncio.create_subprocess_shell(command, env={"SENDSPIN_EVENT": "start"})`
+     -> bash-like invocation, no positional args. Adapter dispatches on
+        `$SENDSPIN_EVENT`.
+
+  2. Stream stop (`--hook-stop`):
+     `asyncio.create_subprocess_shell(command, env={"SENDSPIN_EVENT": "stop"})`
+     -> same as start, with `$SENDSPIN_EVENT=stop`.
+
+  3. Set volume (`--hook-set-volume`):
+     `asyncio.create_subprocess_exec(*shlex.split(command), str(volume))`
+     -> exec-style invocation: NO `SENDSPIN_EVENT` env var, and the MA
+        percent is appended as `argv[1]`. Adapter dispatches on the
+        integer argv[1].
+
+The bare-form integer argv is the form Sendspin's HookVolumeController
+actually produces in production; the documented-but-unused
+`SENDSPIN_EVENT=set-volume VOLUME_MA` form is also accepted for symmetry.
 
 Internal dispatch (not from Sendspin):
 
@@ -364,6 +374,12 @@ def cmd_stop(cfg: dict, log: Log, state: State, lock: Lock) -> int:
 def spawn_cleanup(token: str, log: Log) -> None:
     here = Path(__file__).resolve()
     # setsid + nohup + close fds so the cleanup process survives our exit.
+    # The cleanup child must NOT inherit $SENDSPIN_EVENT from the parent
+    # stop-hook invocation: select_action would otherwise dispatch the
+    # cleanup child back to cmd_stop, spawning yet another cleanup child,
+    # forever. Strip SENDSPIN_EVENT explicitly; leave other env alone.
+    child_env = os.environ.copy()
+    child_env.pop("SENDSPIN_EVENT", None)
     try:
         subprocess.Popen(
             [sys.executable, str(here), "cleanup", token],
@@ -372,6 +388,7 @@ def spawn_cleanup(token: str, log: Log) -> None:
             stderr=subprocess.DEVNULL,
             start_new_session=True,
             close_fds=True,
+            env=child_env,
         )
     except OSError as e:
         log.write("ERROR", "stop", f"failed to spawn cleanup: {e}")
@@ -478,6 +495,63 @@ def cmd_volume(cfg: dict, log: Log, state: State, lock: Lock, raw_value: str) ->
         return 0
 
 
+def select_action(argv: list[str]) -> tuple[str, str | None]:
+    """Decide which adapter action to run given argv and $SENDSPIN_EVENT.
+
+    Recognises the three Sendspin hook contracts plus internal/legacy forms:
+
+      SENDSPIN_EVENT=start                  -> ("start", None)
+      SENDSPIN_EVENT=stop                   -> ("stop", None)
+      SENDSPIN_EVENT=set-volume VOLUME_MA   -> ("set_volume", VOLUME_MA)
+      argv = ["script", "cleanup", TOKEN]   -> ("cleanup", TOKEN)
+      argv = ["script", "volume", N]        -> ("set_volume", N)
+      argv = ["script", "<integer>"]        -> ("set_volume", "<integer>")
+        (bare integer: Sendspin's HookVolumeController invokes the hook
+         as `subprocess_exec(*shlex.split(command), str(volume))` with no
+         env var and the MA percent as the only positional arg)
+
+    Returns (action, raw_value). raw_value is None when not applicable.
+    Raises SystemExit(2) via die() on unrecognised input.
+    """
+    event = os.environ.get("SENDSPIN_EVENT", "").lower()
+    action: str | None = None
+    raw_value: str | None = None
+
+    if event in ("start", "stop", "set-volume"):
+        action = event.replace("-", "_")
+        if action == "set_volume" and len(argv) >= 2:
+            raw_value = argv[1]
+    elif len(argv) >= 2:
+        arg1 = argv[1]
+        if arg1 == "cleanup" and len(argv) >= 3:
+            action = "cleanup"
+            raw_value = argv[2]
+        elif arg1 == "volume" and len(argv) >= 3:
+            action = "set_volume"
+            raw_value = argv[2]
+        elif len(argv) == 2:
+            # Sendspin's HookVolumeController invocation form:
+            # `subprocess_exec(*shlex.split(command), str(volume))` --
+            # no SENDSPIN_EVENT, exactly one positional arg (the MA percent).
+            try:
+                int(arg1)
+            except ValueError:
+                pass
+            else:
+                action = "set_volume"
+                raw_value = arg1
+
+    if action is None:
+        die(
+            "usage (Sendspin hooks): set SENDSPIN_EVENT=start|stop|set-volume "
+            "(set-volume appends MA% as argv[1]); "
+            "usage (manual): yas207-sendspin {cleanup TOKEN|volume N}",
+            code=2,
+        )
+
+    return action, raw_value
+
+
 def main(argv: list[str]) -> int:
     rt = runtime_dir()
     rt.mkdir(parents=True, exist_ok=True)
@@ -498,28 +572,7 @@ def main(argv: list[str]) -> int:
         log.write("ERROR", "init", f"config load failed: {e}")
         return 2
 
-    event = os.environ.get("SENDSPIN_EVENT", "").lower()
-    action = None
-    raw_value = None
-
-    if event in ("start", "stop", "set-volume"):
-        action = event.replace("-", "_")
-        if action == "set_volume" and len(argv) >= 2:
-            raw_value = argv[1]
-    elif len(argv) >= 2:
-        action = argv[1]
-        if action == "cleanup" and len(argv) >= 3:
-            raw_value = argv[2]
-        elif action == "volume" and len(argv) >= 3:
-            action = "set_volume"
-            raw_value = argv[2]
-
-    if action is None:
-        die(
-            "usage (Sendspin hooks): set SENDSPIN_EVENT=start|stop|set-volume; "
-            "usage (manual): yas207-sendspin {cleanup TOKEN|volume N}",
-            code=2,
-        )
+    action, raw_value = select_action(argv)
 
     try:
         if action == "start":
