@@ -2,12 +2,22 @@
 """Sendspin adapter for the Yamaha YAS-207 controller.
 
 This is the SINGLE entry point that Sendspin's --hook-start, --hook-stop
-and --hook-set-volume directives all invoke. argv[1] dispatches:
+and --hook-set-volume directives all invoke. Sendspin's daemon
+(`sendspin/hooks.py`) runs each hook via `asyncio.create_subprocess_shell`
+and injects the event name through the `SENDSPIN_EVENT` environment
+variable; positional arguments are not appended. For the
+set-volume hook, Sendspin additionally passes the MA percent value
+as the final positional argument, which this adapter reads from
+`sys.argv[1]`. Dispatch:
 
-  yas207-sendspin start      (Sendspin's stream-start hook)
-  yas207-sendspin stop       (Sendspin's stream-stop hook)
-  yas207-sendspin cleanup T  (internal: spawned by `stop` after debounce)
-  yas207-sendspin volume N   (Sendspin's volume hook)
+  SENDSPIN_EVENT=start                  -> start-session
+  SENDSPIN_EVENT=stop                   -> schedule stop (cleanup handles /stop-session)
+  SENDSPIN_EVENT=set-volume VOLUME_MA   -> apply MA volume
+
+Internal dispatch (not from Sendspin):
+
+  yas207-sendspin cleanup T  (spawned by stop after debounce)
+  yas207-sendspin volume N   (manual invocation; legacy)
 
 The adapter is the only process that ever contacts the upstream controller
 at /start-session or /stop-session. It owns its own runtime state under
@@ -469,9 +479,6 @@ def cmd_volume(cfg: dict, log: Log, state: State, lock: Lock, raw_value: str) ->
 
 
 def main(argv: list[str]) -> int:
-    if len(argv) < 2:
-        die("usage: yas207-sendspin {start|stop|cleanup TOKEN|volume N}", code=2)
-
     rt = runtime_dir()
     rt.mkdir(parents=True, exist_ok=True)
     try:
@@ -491,20 +498,40 @@ def main(argv: list[str]) -> int:
         log.write("ERROR", "init", f"config load failed: {e}")
         return 2
 
-    action = argv[1]
+    event = os.environ.get("SENDSPIN_EVENT", "").lower()
+    action = None
+    raw_value = None
+
+    if event in ("start", "stop", "set-volume"):
+        action = event.replace("-", "_")
+        if action == "set_volume" and len(argv) >= 2:
+            raw_value = argv[1]
+    elif len(argv) >= 2:
+        action = argv[1]
+        if action == "cleanup" and len(argv) >= 3:
+            raw_value = argv[2]
+        elif action == "volume" and len(argv) >= 3:
+            action = "set_volume"
+            raw_value = argv[2]
+
+    if action is None:
+        die(
+            "usage (Sendspin hooks): set SENDSPIN_EVENT=start|stop|set-volume; "
+            "usage (manual): yas207-sendspin {cleanup TOKEN|volume N}",
+            code=2,
+        )
+
     try:
         if action == "start":
             return cmd_start(cfg, log, state, lock)
         if action == "stop":
             return cmd_stop(cfg, log, state, lock)
         if action == "cleanup":
-            if len(argv) != 3:
-                die("usage: yas207-sendspin cleanup TOKEN", code=2)
-            return cmd_cleanup(cfg, log, state, lock, argv[2])
-        if action == "volume":
-            if len(argv) != 3:
-                die("usage: yas207-sendspin volume MA_PERCENT", code=2)
-            return cmd_volume(cfg, log, state, lock, argv[2])
+            return cmd_cleanup(cfg, log, state, lock, raw_value or "")
+        if action == "set_volume":
+            if raw_value is None:
+                die("set-volume hook requires the MA value as argv[1]", code=2)
+            return cmd_volume(cfg, log, state, lock, raw_value)
         die(f"unknown action: {action!r}", code=2)
     except Exception as e:
         log.write("ERROR", action, f"unhandled exception: {e}")

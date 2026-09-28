@@ -22,8 +22,9 @@ TimeoutStartSec=30
 # /run/user/<euid>/yas207/.
 NoNewPrivileges=true
 PrivateTmp=true
-ProtectSystem=strict
+ProtectSystem=full
 ProtectHome=read-only
+ReadWritePaths=/run/user/%U
 DeviceAllow=/dev/rfcomm0 rw
 RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
 RestrictNamespaces=true

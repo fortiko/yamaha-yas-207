@@ -68,8 +68,35 @@ mode 0700 inside `control/control.rb`). The directory lives under
 the per-user systemd runtime path, which `systemd --user` manages
 automatically once `loginctl enable-linger yas207` is in place.
 
-Do NOT set `RuntimeDirectory=yas207` in either user unit — that would
-have systemd manage the directory as root and break `yas207`'s writes.
+Do NOT set `RuntimeDirectory=yas207` in either user unit — that
+would have systemd manage the directory as root and break `yas207`'s
+writes. The user units must grant `ReadWritePaths=/run/user/%U`
+(and `/home/yas207/.config/sendspin` for Sendspin) so the controller
+and adapter can create their snapshot/state/lock files.
+
+## Sendspin hook wiring
+
+Sendspin's daemon runs each hook via
+`asyncio.create_subprocess_shell(command, shell=True)` and injects
+the event name through the `SENDSPIN_EVENT` environment variable;
+positional arguments are only appended for the volume hook, where
+the MA percent becomes `argv[1]`. The adapter (`yas207-sendspin`)
+dispatches on `SENDSPIN_EVENT`:
+
+```
+SENDSPIN_EVENT=start                  → start-session
+SENDSPIN_EVENT=stop                   → schedule stop (cleanup handles /stop-session)
+SENDSPIN_EVENT=set-volume MA          → apply MA volume (MA in argv[1])
+```
+
+So the systemd unit invokes the adapter *without* a subcommand:
+
+```
+ExecStart=.../sendspin daemon \
+  --hook-start      /usr/local/sbin/yas207/yas207-sendspin \
+  --hook-stop       /usr/local/sbin/yas207/yas207-sendspin \
+  --hook-set-volume /usr/local/sbin/yas207/yas207-sendspin
+```
 
 ## Failure / recovery
 
