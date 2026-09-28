@@ -218,7 +218,8 @@ class YamahaSoundbarRemote
 	attr_reader :device_state, :config, :runtime_dir, :rfcomm_device, :http_bind,
 		:http_port, :sync_timeout, :status_refresh, :manage_power,
 		:initial_intent_mode, :initial_intent_config, :session,
-		:restoring_session, :snapshot_path, :restore_phase, :restore_error
+		:restoring_session, :snapshot_path, :restore_phase, :restore_error,
+		:deferred_final_mute
 
 	# Handle packet received via serial.
 	#
