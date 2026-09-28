@@ -142,6 +142,61 @@ else
 end
 ENV['YAS207_CONFIG'] = '$CONFIG'
 
+# 4. Configured initial_intent: validation + normalization at config load.
+# 4a. A valid JSON-style (string-key) intent is normalized to the internal
+#     key representation (symbols, domain-checked values).
+r = YamahaSoundbarRemote.new({ 'controller' => { 'initial_intent' =>
+  { 'surround' => '3d', 'subwoofer' => 16, 'bass_ext' => true, 'clearvoice' => true } } })
+if r.instance_variable_get(:@initial_intent_mode) == :configured &&
+   r.instance_variable_get(:@initial_intent_config) ==
+     { surround: :'3d', subwoofer: 16, bass_ext: true, clearvoice: true }
+  puts \"OK  configured initial_intent normalized (string keys -> symbols, values domain-checked)\"
+else
+  puts \"FAIL configured initial_intent normalization: mode=#{r.instance_variable_get(:@initial_intent_mode)} config=#{r.instance_variable_get(:@initial_intent_config).inspect}\"
+  failures << 'configured initial_intent normalization'
+end
+
+# 4b. Invalid configured key -> fail fast at config load.
+begin
+  YamahaSoundbarRemote.new({ 'controller' => { 'initial_intent' => { 'surrounds' => '3d' } } })
+  puts 'FAIL invalid initial_intent key accepted'; failures << 'invalid initial_intent key'
+rescue ArgumentError
+  puts 'OK  invalid initial_intent key rejected at config load'
+end
+
+# 4c. Invalid configured value -> fail fast at config load.
+[
+  [ 'bad surround',  { 'surround' => 'bogus' } ],
+  [ 'off-grid subwoofer', { 'subwoofer' => 17 } ],
+  [ 'volume out of range', { 'volume' => 999 } ],
+  [ 'non-bool bass_ext', { 'bass_ext' => 'yes' } ],
+  [ 'bad input', { 'input' => 'hdmi1' } ],
+].each do |label, bad|
+  begin
+    YamahaSoundbarRemote.new({ 'controller' => { 'initial_intent' => bad } })
+    puts \"FAIL invalid initial_intent value accepted: #{label}\"; failures << \"invalid initial_intent value (#{label})\"
+  rescue ArgumentError
+    puts \"OK  invalid initial_intent value rejected: #{label}\"
+  end
+end
+
+# 4d. Non-object initial_intent -> fail fast; nil stays present_empty.
+r = YamahaSoundbarRemote.new({ 'controller' => { 'initial_intent' => nil } })
+if r.instance_variable_get(:@initial_intent_mode) == :present_empty
+  puts 'OK  initial_intent nil -> present_empty (no intent applied)'
+else
+  puts \"FAIL initial_intent nil: #{r.instance_variable_get(:@initial_intent_mode)}\"
+  failures << 'initial_intent nil'
+end
+[ 'tv', [ '3d' ], 16 ].each do |bad|
+  begin
+    YamahaSoundbarRemote.new({ 'controller' => { 'initial_intent' => bad } })
+    puts \"FAIL non-object initial_intent accepted: #{bad.inspect}\"; failures << \"non-object initial_intent #{bad.inspect}\"
+  rescue ArgumentError
+    puts \"OK  non-object initial_intent rejected: #{bad.inspect}\"
+  end
+end
+
 if failures.empty?
   puts ''
   puts 'PASS'

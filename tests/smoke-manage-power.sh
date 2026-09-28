@@ -7,7 +7,9 @@
 #   - manage_power=true: parse_intent keeps :power and enforce_intent
 #     auto-powers the device on when it is off.
 #   - manage_power=false: parse_intent strips :power and enforce_intent
-#     never issues power_on.
+#     never issues power_on; while the device is off it enqueues NO
+#     sound-setting commands (the pending intent is deferred and enforced
+#     once the device reports power=true).
 #   - initial_intent tri-state is reachable.
 
 set -u
@@ -115,17 +117,30 @@ else
   failures << 'parse_intent preserves :power'
 end
 
-# --- 5. manage_power=false: no power_on when device off ---
+# --- 5. manage_power=false: device off -> no power_on and NO
+#        sound-setting commands at all; the intent survives and is
+#        enforced once the device reports power=true. ---
 r4 = YamahaSoundbarRemote.new({'controller' => {'manage_power' => false, 'initial_intent' => {}}})
 sync_off(r4)
 r4.send_intent({'input' => 'analog'})
-r4.handle_received(TV_OFF)  # next status report triggers enforcement
+r4.handle_received(TV_OFF)  # next status report: still off
 sent = drain_queue(r4)
+intent = r4.instance_variable_get(:@intent)
 if !sent.any? { |s| s.include?('40787e') } &&
-   sent.any? { |s| s.include?('4078d1') }
-  puts "OK  manage_power=false skips auto-power-on (input still enforced)"
+   !sent.any? { |s| s.include?('4078d1') } &&
+   intent[:input] == :analog
+  # Device powers on: the pending intent must now be enforced.
+  r4.handle_received([5, 1, 1, 0x7, 0, 10, 16, 0, 0, 0, 0, 0x0a, 0])  # on, input=tv
+  sent = drain_queue(r4)
+  if !sent.any? { |s| s.include?('40787e') } &&
+     sent.any? { |s| s.include?('4078d1') }
+    puts "OK  manage_power=false: no power_on, no off-device sound commands; deferred intent enforced on power-up"
+  else
+    puts "FAIL manage_power=false deferred intent on power-up: #{sent.inspect}"
+    failures << 'manage_power=false deferred intent'
+  end
 else
-  puts "FAIL manage_power=false auto-power-on/input: #{sent.inspect}"
+  puts "FAIL manage_power=false off-device: sent=#{sent.inspect} intent=#{intent.inspect}"
   failures << 'manage_power=false skips auto-power-on'
 end
 
