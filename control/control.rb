@@ -18,6 +18,7 @@ end
 require 'thread'
 require 'webrick'
 require 'json'
+require 'fileutils'
 
 # YAS-207 remote.
 #
@@ -116,14 +117,59 @@ class YamahaSoundbarRemote
 		clearvoice: false,
 	}.freeze
 
-	def initialize
+	# Load configuration from disk. Falls back to {} if no config file
+	# exists; this preserves upstream legacy behaviour.
+	def self.load_config
+		path = ENV['YAS207_CONFIG']
+		path ||= File.join(Dir.home, '.config', 'yas207', 'controller.json')
+		return {} unless path && File.exist?(path)
+		JSON.parse(File.read(path))
+	rescue => e
+		STDERR.puts "! Failed to load config from #{path}: #{e}"
+		exit 2
+	end
+
+	# Resolve runtime directory deterministically from euid.
+	def self.runtime_dir
+		ENV['YAS207_RUNTIME_DIR'] || "/run/user/#{Process.euid}/yas207"
+	end
+
+	def initialize(config = nil)
+		@config = config || self.class.load_config
+		ctrl = @config['controller'] || {}
+
+		@rfcomm_device    = ENV['CONTROL_DEVICE'] || ctrl['rfcomm_device'] || '/dev/rfcomm0'
+		@http_bind        = ctrl['http_bind']   || '127.0.0.1'
+		@http_port        = ctrl['http_port']   || 8000
+		@sync_timeout     = ctrl['sync_timeout_seconds']   || SYNC_TIMEOUT
+		@status_refresh   = ctrl['status_refresh_seconds'] || STATUS_REFRESH
+		@manage_power     = ctrl.key?('manage_power') ? !!ctrl['manage_power'] : true
+		@runtime_dir      = self.class.runtime_dir
+
+		# Tri-state initial_intent handling.
+		# :absent         => apply legacy INITIAL_INTENT on first sync
+		# :present_empty  => apply NO initial intent
+		# :configured     => apply exactly @initial_intent_config
+		if !ctrl.key?('initial_intent')
+			@initial_intent_mode = :absent
+			@initial_intent_config = nil
+		elsif ctrl['initial_intent'].nil? || (ctrl['initial_intent'].respond_to?(:empty?) && ctrl['initial_intent'].empty?)
+			@initial_intent_mode = :present_empty
+			@initial_intent_config = nil
+		else
+			@initial_intent_mode = :configured
+			@initial_intent_config = ctrl['initial_intent']
+		end
+
 		@device_state = {}
 		@queue = Queue.new
 		@state = :initial
 		@intent = {}
 		@session = nil
 	end
-	attr_reader :device_state
+	attr_reader :device_state, :config, :runtime_dir, :rfcomm_device, :http_bind,
+		:http_port, :sync_timeout, :status_refresh, :manage_power,
+		:initial_intent_mode, :initial_intent_config
 
 	# Handle packet received via serial.
 	#
@@ -136,12 +182,12 @@ class YamahaSoundbarRemote
 			enqueue(INIT_STRING)
 		elsif packet == :heartbeat
 			if @state == :synced
-				if @last_status_at + STATUS_REFRESH < Time.now
+				if @last_status_at + @status_refresh < Time.now
 					@last_status_at = Time.now
 					enqueue(COMMANDS[:report_status])
 				end
 			else
-				if @reset_at + SYNC_TIMEOUT < Time.now
+				if @reset_at + @sync_timeout < Time.now
 					STDERR.puts "! Couldn't sync, retrying by :reset."
 					handle_received(:reset)
 				end
@@ -160,7 +206,13 @@ class YamahaSoundbarRemote
 				if @state == :init_followup
 					@state = :synced
 					@last_status_at = Time.now
-					add_intent({initial: true})
+					# Apply initial intent per tri-state configuration:
+					#   :absent         => upstream legacy INITIAL_INTENT
+					#   :configured     => configured @initial_intent_config
+					#   :present_empty  => no initial intent applied
+					if @initial_intent_mode == :absent || @initial_intent_mode == :configured
+						add_intent({initial: true})
+					end
 					if packet != [0, 2, 0]
 						STDERR.puts "? Received unexpected init_followup packet: #{packet.inspect}"
 					end
@@ -172,10 +224,8 @@ class YamahaSoundbarRemote
 				puts "+ DS: #{params.map { |k,v| "#{k}:#{v}" }.join(',')}"
 				@device_state = params
 				if @intent[:initial]
-					# We have initial intent, but we also can have some other
-					# intent already in from the user. So let's use our initial
-					# with an update from the user as the final thing.
-					intent = INITIAL_INTENT.dup
+					# Initial-intent handling. Tri-state picks the source intent.
+					intent = (@initial_intent_mode == :configured ? @initial_intent_config : INITIAL_INTENT).dup
 					if @device_state[:power] && @device_state[:input] == :bluetooth
 						# we probably just woke up the device → put it back to sleep @ HDMI
 						intent.update({input: :hdmi, power: false})
@@ -251,22 +301,26 @@ class YamahaSoundbarRemote
 		retried = intent.delete(:enforce_retried)
 		device_state = @device_state.dup
 
+		# If power is not managed, strip :power from intent before computing deltas.
+		intent.delete(:power) unless @manage_power
+
 		delta_keys = intent.keys.reduce([]) { |m, x| m << x unless device_state[x] == intent[x]; m }
 
 		return {} if delta_keys.empty? # zero diff → stable state reached
 		# also zero diff (mute doesn't work when powered off) >>
 		return {} if delta_keys == [:mute] && device_state[:power] == false
 
-		# pathological case: power_off and non-empty list of commands
-		if !device_state[:power] && !(delta_keys - [:power]).empty?
+		# Pathological case: device is off but other intents exist. Upstream
+		# auto-powers-on here; we only do so when manage_power is true.
+		if @manage_power && !device_state[:power] && !(delta_keys - [:power]).empty?
 			enqueue(COMMANDS[:power_on]) # turn on
 			device_state[:power] = true # mark it's on
 			delta_keys << :power unless delta_keys.include?(:power)
 			intent[:power] ||= false # force off (unless intended otherwise)
 		end
 
-		# first power on (if needed)
-		if intent[:power] && !device_state[:power]
+		# First power on (if needed); also gated on manage_power.
+		if @manage_power && intent[:power] && !device_state[:power]
 			enqueue(COMMANDS[:power_on])
 		end
 
@@ -428,6 +482,8 @@ class YamahaSoundbarRemote
 				raise ArgumentError, "#{k} #$!"
 			end
 		}.to_h
+		# manage_power=false: strip :power from user-supplied intents.
+		validated_intent.delete(:power) unless @manage_power
 		validated_intent
 	end
 
