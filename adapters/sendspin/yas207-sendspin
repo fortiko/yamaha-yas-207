@@ -138,8 +138,8 @@ def validate_config(cfg: dict) -> None:
             die(f"config.player missing required key: {key}", code=2)
     if not isinstance(ply["audio_device"], dict):
         die("player.audio_device must be an object", code=2)
-    if not (ply["audio_device"].get("match") or ply["audio_device"].get("index_override") is not None):
-        die("player.audio_device must contain at least one of 'match' or 'index_override'", code=2)
+    if not (ply["audio_device"].get("match") or "").strip():
+        die("player.audio_device.match must be a non-empty string", code=2)
     import re as _re
     if not _re.match(r"^(pcm|flac):\d+:\d+:[12]$", ply["audio_format"]):
         die("player.audio_format must match ^(pcm|flac):<rate>:<bits>:<channels>$", code=2)

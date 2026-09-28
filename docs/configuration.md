@@ -115,18 +115,19 @@ hardware max raw is 50.
 ```json
 {
   "audio_device": {
-    "match":          "Example ALSA Device",
-    "index_override": 0
+    "match": "Example ALSA Device"
   }
 }
 ```
 
 | Key | Type | Notes |
 |---|---|---|
-| `match` | string | durable name or name prefix. Sent to Sendspin as `--audio-device "<match>"` |
-| `index_override` | int ≥ 0 | optional. If set, overrides `match`. **Manual tests only**; production deployments should rely on `match`. |
+| `match` | string | durable ALSA name or name prefix. Sent to Sendspin as `--audio-device "<match>"` |
 
-If neither key is set the player config is invalid.
+`match` is required. The match string is sent verbatim to Sendspin
+(`--audio-device "<match>"`); PortAudio’s substring match resolves the
+durable name at runtime, so the numeric index cannot drift across
+reboots or device reordering.
 
 ## Configuration validation
 
@@ -138,7 +139,7 @@ Hard requirements (config is invalid without):
 * All keys marked **required** above
 * `controller.bluetooth_address` matches `^[0-9A-Fa-f]{2}(:[0-9A-Fa-f]{2}){5}$`
 * `session.music_intent` is an object (may be empty)
-* `player.audio_device` contains at least one of `match` or `index_override`
+* `player.audio_device.match` is a non-empty string
 * `volume.min_nonzero_raw ≤ volume.max_raw ≤ 50`
 * If `volume.zero_is_mute == true`: `volume.min_nonzero_raw ≥ 1`
 

@@ -92,7 +92,8 @@ the upstream blog post:
   These are owned by the player (Sendspin, Shairport). The Yamaha controller
   does not need to know which ALSA device is producing audio.
 * TV / HDMI-ARC wiring. Out of scope.
-* Future Bluetooth A2DP output. Deferred.
+* Bluetooth A2DP output. Not implemented in this branch (see
+  `docs/compatibility.md`).
 
 The general project remains capable of supporting all these audio paths;
 the configuration only encodes what is unique to a given installation.
