@@ -558,14 +558,14 @@ if __FILE__ == $0
 
 	threads << Thread.new do
 		print "+ BT handler init...\n"  # $10 to the first person explaining why not `puts`
-		YamahaSerialInputWorker.as_thread(ENV['CONTROL_DEVICE'] || '/dev/rfcomm0', ysr)
+		YamahaSerialInputWorker.as_thread(ysr.rfcomm_device, ysr)
 	end
 
 	threads << Thread.new do
 		print "+ Webserver...\n"
 		s = WEBrick::HTTPServer.new({
-			:Port => 8000,
-			:BindAddress => "127.0.0.1",
+			:Port => ysr.http_port,
+			:BindAddress => ysr.http_bind,
 			:Logger => WEBrick::Log.new('/dev/null'),
 			:AccessLog => [ [$stdout, "> %h %U %b"] ],
 			:DoNotReverseLookup => true,
@@ -644,6 +644,22 @@ if __FILE__ == $0
 			else
 				res.body = "nope (missing params: either name or intent).\n"
 			end
+		end
+
+		# /state returns a JSON snapshot of current device state plus the
+		# session model (name, active, restoring). Players can use it to
+		# positively confirm session-restore completion before they tear
+		# down their own resources.
+		s.mount_proc("/state") do |req, res|
+			res['Content-Type'] = 'application/json; charset=utf-8'
+			res.body = JSON.pretty_generate({
+				'device_state' => ysr.device_state,
+				'session' => {
+					'name'      => ysr.session ? ysr.session.first : nil,
+					'active'    => !ysr.session.nil?,
+					'restoring' => ysr.restoring_session,
+				},
+			})
 		end
 
 		s.mount_proc("/") do |req, res|
