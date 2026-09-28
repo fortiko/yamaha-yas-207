@@ -155,15 +155,37 @@ class YamahaSoundbarRemote
 	# :input    restore input (only after :volume AND :sound verified)
 	# :post_input_volume verify volume/mute again while still muted
 	# :final_mute restore saved mute value
+	# :final_power restore saved power value LAST. Only entered when the
+	#              snapshot positively records this session owning an
+	#              off->on transition (saved_state.power==false AND
+	#              power_on_completed==true). Otherwise the phase is
+	#              skipped entirely.
 	RESTORE_PHASES = [
-		:mute, :volume, :sound, :input, :post_input_volume, :final_mute
+		:mute, :volume, :sound, :input, :post_input_volume, :final_mute,
+		:final_power
 	].freeze
 
 	# A distinct 0x12 reply is the completion barrier for volume operations.
 	# Try direct correction first, then home to the lower boundary if needed.
 	MAX_VOLUME_RESTORE_CORRECTIONS = 2
 	VOLUME_HOME_MARGIN = 5
+
+	# Maximum time we synchronously wait for the Yamaha to confirm power=true
+	# after issuing power_on during an explicit start_session wake-up.
+	# Sized for real hardware (YAS-207 wakes from standby in ~1.5s; we leave
+	# headroom for repeated retries and SPP latency).
+	POWER_ON_TIMEOUT = 10.0
+	# Bounded retry budget for the :final_power phase to confirm power=false.
+	# Kept conservative so a stuck-CEC device doesn't loop forever.
+	MAX_FINAL_POWER_ATTEMPTS = 2
 	RESTORE_QUERY_TIMEOUT = 2.0
+
+	# Bounded verification window for the idle-input sanitization
+	# correction: after issuing the set_input command, this is how long we
+	# wait for a device status report confirming the policy input before
+	# giving up (the correction re-arms on the next idle observation of
+	# input=:bluetooth).
+	IDLE_INPUT_CORRECTION_TIMEOUT = 15.0
 
 	# Load configuration from disk. Falls back to {} if no config file
 	# exists; this preserves upstream legacy behaviour.
@@ -192,6 +214,12 @@ class YamahaSoundbarRemote
 		@sync_timeout     = ctrl['sync_timeout_seconds']   || SYNC_TIMEOUT
 		@status_refresh   = ctrl['status_refresh_seconds'] || STATUS_REFRESH
 		@manage_power     = ctrl.key?('manage_power') ? !!ctrl['manage_power'] : true
+		# Session-scoped power ownership: only effective when @manage_power is
+		# false. With @manage_power=true (legacy auto-power-on), this flag is
+		# moot -- the upstream auto-power-on path runs as it always did.
+		@power_on_for_session_starts =
+			ctrl.key?('power_on_for_session_starts') ?
+				!!ctrl['power_on_for_session_starts'] : false
 		@runtime_dir      = self.class.runtime_dir
 		@snapshot_path    = File.join(@runtime_dir, 'controller', 'session.json')
 		FileUtils.mkdir_p(File.dirname(@snapshot_path))
@@ -209,6 +237,31 @@ class YamahaSoundbarRemote
 		else
 			@initial_intent_mode = :configured
 			@initial_intent_config = ctrl['initial_intent']
+		end
+
+		# Post-init / SPP-reconnect idle input sanitization. Disabled (nil)
+		# unless controller.idle_input_policy is set, preserving upstream
+		# behaviour by default. When set to an input name (e.g. "tv"), an
+		# IDLE device -- powered on, no active session, no restore in
+		# progress, no pending intent -- that is observed with
+		# input=:bluetooth (e.g. woken by an SPP/RFCOMM reconnect) is
+		# corrected to that input and verified via the next device status
+		# report. SPP/RFCOMM stays control-only; this never touches power,
+		# sessions, or restore state.
+		@idle_input_policy = nil
+		if ctrl.key?('idle_input_policy') && !ctrl['idle_input_policy'].nil?
+			policy = ctrl['idle_input_policy']
+			unless policy.is_a?(String) && !policy.empty?
+				raise ArgumentError,
+					"controller.idle_input_policy must be a non-empty input " +
+					"name string, got #{policy.inspect}"
+			end
+			unless COMMANDS.key?(:"set_input_#{policy}")
+				raise ArgumentError,
+					"controller.idle_input_policy '#{policy}' has no " +
+					"set_input command"
+			end
+			@idle_input_policy = policy.to_sym
 		end
 
 		@device_state = {}
@@ -231,12 +284,36 @@ class YamahaSoundbarRemote
 		@sent_volume_queries = Queue.new
 		@status_generation = 0
 		@volume_status_generation = 0
+
+		# Session-scoped power ownership (see also @power_on_for_session_starts).
+		# When a start_session wakes a sleeping Yamaha, we synchronously wait
+		# for power=true on a ConditionVariable before queueing the music
+		# intent. The serial worker thread signals the condvar from
+		# handle_received when device_state[:power] flips to true.
+		@wake_mutex = Mutex.new
+		@wake_cond = ConditionVariable.new
+		@wake_pending = false
+		# Idle-input sanitization correction state (see sanitize_idle_input).
+		@idle_input_correction_pending = false
+		@idle_input_correction_at = nil
+		# Snapshot-extended fields. These are only meaningful when a snapshot
+		# has been persisted; defaults are conservative (no off->on owned,
+		# no power-off at restore time).
+		@snapshot_session_powered_on = false
+		@snapshot_power_on_completed = false
+		# Persistent saved-state reference used by :final_power to decide
+		# whether to emit power_off. @session itself is cleared at
+		# stop_session time, so we keep a separate copy. Populated by
+		# stop_session, cleared when the staged restore settles (including
+		# the :final_power phase).
+		@restore_saved_state = nil
 	end
 	attr_reader :device_state, :session, :restoring_session, :restore_phase,
 		:config, :runtime_dir, :rfcomm_device, :http_bind, :http_port,
 		:sync_timeout, :status_refresh, :manage_power, :initial_intent_mode,
 		:initial_intent_config, :snapshot_path, :restore_error,
-		:status_generation, :volume_status_generation
+		:status_generation, :volume_status_generation, :idle_input_policy,
+		:power_on_for_session_starts
 
 	# Handle packet received via serial.
 	#
@@ -248,6 +325,8 @@ class YamahaSoundbarRemote
 			@enqueued_volume_queries.clear
 			@sent_volume_queries.clear
 			@restore_query_sent_at = nil
+			@idle_input_correction_pending = false
+			@idle_input_correction_at = nil
 			@reset_at = Time.now
 			enqueue(INIT_STRING)
 		elsif packet == :heartbeat
@@ -303,6 +382,16 @@ class YamahaSoundbarRemote
 				@device_state = params
 				@status_generation += 1
 
+				# Session-scoped wake-up: if start_session issued a synchronous
+				# power_on and is waiting for verification, signal the condvar
+				# the moment device_state[:power] flips to true. The waiting
+				# thread (in start_session) wakes up, persists the
+				# power_on_completed=true flag into the snapshot, and proceeds
+				# with the music intent.
+				if @wake_pending && @device_state[:power]
+					@wake_mutex.synchronize { @wake_cond.broadcast }
+				end
+
 				# Crash recovery: after first device-state observation, attempt to
 				# restore the persistent session snapshot if one exists. We do this
 				# exactly once and only if no live session is currently active.
@@ -310,6 +399,10 @@ class YamahaSoundbarRemote
 					@snapshot_recovered = true
 					recover_session_snapshot
 				end
+
+				# Post-init / SPP-reconnect idle input sanitization
+				# (config-gated; see sanitize_idle_input).
+				sanitize_idle_input
 
 				if @intent[:initial]
 					# Initial-intent handling. Tri-state picks the source intent.
@@ -325,11 +418,19 @@ class YamahaSoundbarRemote
 				elsif @intent[:start_session]
 					name = @intent.delete(:start_session)
 					if @session
-						STDERR.puts "! Starting a new session '#{name}' while" +
-							" '#{@session.first}' active; re-using the DS:" +
-							" #{@session.last.inspect}; intent:" +
-							" #{@intent.inspect}."
-						@session = [name, @session.last]
+						# @session was pre-created by start_session BEFORE the
+						# wake-up (if any). Its .last contains the pre-wake
+						# saved_state; do NOT replace it with @device_state.dup
+						# because by this point device_state[:power] may already
+						# reflect the post-wake state. We just refresh the name
+						# in case the same session is reused.
+						if @session.first != name
+							STDERR.puts "! Starting a new session '#{name}' while" +
+								" '#{@session.first}' active; re-using the DS:" +
+								" #{@session.last.inspect}; intent:" +
+								" #{@intent.inspect}."
+							@session = [name, @session.last]
+						end
 					else
 						puts "+ Starting a new session '#{name}' with" +
 							" intent: #{@intent.inspect}."
@@ -348,9 +449,11 @@ class YamahaSoundbarRemote
 						# Persist snapshot BEFORE we clear @intent, so a crash mid-restore
 						# still allows the next restart to recover.
 						persist_session_snapshot(name, saved)
+						# Keep an in-memory reference to saved so :final_power can
+						# read saved_state[:power] after @session is gone.
+						@restore_saved_state = saved
 						# Strip :power from restore if not managing power.
 						restore_state = @manage_power ? saved : saved.reject { |k, _| k == :power }
-						# Merge saved into intent; mute will be forced below.
 						@intent.update(restore_state)
 						# SAFETY INVARIANT: temporary mute BEFORE volume/input changes
 						# during stop_session restoration.
@@ -554,12 +657,68 @@ class YamahaSoundbarRemote
 			enforce_restore_sound_phase(intent, device_state)
 		when :input
 			enforce_restore_input_phase(intent, device_state)
+		when :final_power
+			enforce_restore_final_power_phase(intent, device_state)
 		else
 			@restore_error = "unknown restore phase: #{@restore_phase}"
 			@restore_phase = :failed
 			STDERR.puts "! #{@restore_error}; input remains unchanged and snapshot is preserved."
 			intent
 		end
+	end
+
+	# Phase :final_power -- the LAST phase of staged restore.
+	#
+	# Runs only when the snapshot positively records this session as the
+	# owner of an off->on transition (saved_state.power==false AND
+	# power_on_completed==true). Emits power_off and asks for a fresh
+	# 0x05 readback; verification happens in the 0x05 branch below.
+	#
+	# On confirmation of power=false: snapshot removed, restore settles.
+	# On persistent failure: log via @restore_error and settle anyway
+	# -- a stuck-CEC Yamaha that we cannot power off is less disruptive
+	# than leaving a stuck restore in progress.
+	private def enforce_restore_final_power_phase(intent, device_state)
+		if !@restore_phase_status_refreshed
+			@restore_phase_status_refreshed = true
+			enqueue(COMMANDS[:report_status])
+			return intent.update({enforce_retried: true})
+		end
+
+		if !device_state[:power]
+			# Power confirmed off. Done.
+			@restore_phase = nil
+			@restoring_session = false
+			@restore_error = nil
+			@restore_saved_state = nil
+			@snapshot_session_powered_on = false
+			@snapshot_power_on_completed = false
+			delete_session_snapshot
+			return {}
+		end
+
+		# Power is still on. Bounded retry of power_off.
+		@restore_volume_attempts += 1
+		if @restore_volume_attempts <= MAX_FINAL_POWER_ATTEMPTS
+			STDERR.puts "! Final power-off retry: device still on (attempt #{@restore_volume_attempts})"
+			enqueue(COMMANDS[:power_off])
+			enqueue(COMMANDS[:report_status])
+			return intent.update({enforce_retried: true})
+		end
+
+		# Bounded retry exhausted. Conservative settle: log the failure
+		# via @restore_error but don't strand the snapshot. The Yamaha is
+		# left on; if the user explicitly wants it off they can do so
+		# manually. We DO NOT loop forever.
+		@restore_error = "final power-off could not be confirmed after #{MAX_FINAL_POWER_ATTEMPTS} attempts; device left on"
+		STDERR.puts "! #{@restore_error}"
+		@restore_phase = nil
+		@restoring_session = false
+		@restore_saved_state = nil
+		@snapshot_session_powered_on = false
+		@snapshot_power_on_completed = false
+		delete_session_snapshot
+		return {}
 	end
 
 	private def request_restore_mute_status
@@ -687,9 +846,29 @@ class YamahaSoundbarRemote
 		if status[:volume] == intent[:volume] &&
 			(final_mute.nil? || status[:mute] == final_mute)
 			@deferred_final_mute = nil
+			# After the saved mute has been verified, decide whether a
+			# final power-off is required. Power is ALWAYS restored LAST;
+			# we only enter the :final_power phase if the snapshot positively
+			# records this session owning an off->on transition
+			# (saved_state.power==false AND power_on_completed==true).
+			# Otherwise skip directly to finalize.
+			if final_power_restore_required?
+				@restore_phase = :final_power
+				@restore_phase_status_refreshed = false
+				@restore_volume_attempts = 0
+				# power_off is a status-bearing command; ask for a fresh
+				# readback so the next 0x05 reply can confirm power=false.
+				enqueue(COMMANDS[:power_off])
+				enqueue(COMMANDS[:report_status])
+				return intent
+			end
+			# No final power phase needed. Clean up and settle.
 			@restore_phase = nil
 			@restoring_session = false
 			@restore_error = nil
+			@restore_saved_state = nil
+			@snapshot_session_powered_on = false
+			@snapshot_power_on_completed = false
 			delete_session_snapshot
 			return {}
 		end
@@ -702,6 +881,23 @@ class YamahaSoundbarRemote
 		end
 
 		fail_restore_volume(intent, status, 'final volume/mute verification failed')
+	end
+
+	# Decide whether the staged restore should enter the :final_power phase.
+	# Pre-conditions:
+	#   - saved_state.power == false  (snapshot says we should leave it off)
+	#   - @snapshot_power_on_completed == true  (we actually powered it on)
+	# Without the second condition we may have crashed before our power_on
+	# completed, leaving us unable to distinguish our wake-up from external
+	# activity (e.g. TV being turned on). In that case we be conservative
+	# and skip the power-off: leaving the device in its current state is
+	# less disruptive than blindly powering off something the user just
+	# turned on.
+	private def final_power_restore_required?
+		saved = @restore_saved_state
+		return false unless saved
+		return false unless @snapshot_power_on_completed
+		saved[:power] == false
 	end
 
 	# Phase :sound.
@@ -804,10 +1000,161 @@ class YamahaSoundbarRemote
 	def start_session(name, intent)
 		ensure_not_restoring!
 		if @state == :synced
+			# Capture the COMPLETE pre-session snapshot BEFORE any session-owned
+			# power_on. The saved_state must reflect the device state observed
+			# at session acquisition; if the YAS was off when start_session
+			# arrives, saved_state.power must remain false even though the
+			# wake_yamaha_for_session that follows flips device_state[:power]
+			# to true. This ordering is what lets the :final_power phase of
+			# the eventual staged restore correctly decide whether to power
+			# the device back off at session end.
+			if @session.nil?
+				@snapshot_session_powered_on = false
+				@snapshot_power_on_completed = false
+				@session = [name, @device_state.dup]
+				persist_session_snapshot(name, @session.last)
+			end
+
+			# Session-scoped power ownership: if the user opted into
+			# power_on_for_session_starts and the Yamaha is currently off,
+			# synchronously wake it (with bounded timeout) BEFORE the music
+			# intent is queued. wake_yamaha_for_session updates
+			# @snapshot_session_powered_on / @snapshot_power_on_completed
+			# but does NOT mutate @session.last, so the pre-wake saved_state
+			# is preserved for the eventual :final_power decision.
+			if @power_on_for_session_starts && @manage_power == false &&
+				@device_state[:power] == false
+				wake_yamaha_for_session
+			end
+
 			add_intent(parse_intent(intent).update({start_session: name}))
 		else
 			raise RuntimeError, "device not ready"
 		end
+	end
+
+	# Synchronously issue power_on and wait for the next 0x05 reply that
+	# shows device_state[:power]==true. Raises on timeout.
+	#
+	# The pre-session snapshot was already captured by start_session before
+	# this method was called; @session.last already contains the
+	# pre-wake device state. This method only mutates the snapshot's
+	# session_powered_on / power_on_completed ownership flags:
+	#
+	#   session_powered_on=true is set BEFORE issuing power_on, so a crash
+	#     before wake completes leaves a recoverable record on disk.
+	#   power_on_completed=true is set AFTER observing power=true, so the
+	#     :final_power phase of staged restore knows this session owns
+	#     the off->on transition and should power the device back off.
+	#
+	# Importantly this method does NOT mutate @session.last -- the saved
+	# pre-wake state must remain so the eventual :final_power decision
+	# is correct.
+	private def wake_yamaha_for_session
+		# Mark this session as one that will own an off->on transition.
+		@snapshot_session_powered_on = true
+		@snapshot_power_on_completed = false
+		persist_session_snapshot(@session ? @session.first : '',
+			@session ? @session.last : {})
+
+		@wake_pending = true
+		enqueue(COMMANDS[:power_on])
+		enqueue(COMMANDS[:report_status])
+
+		# Wait until the device positively reports power=true (verified
+		# wake) or the timeout expires. The loop condition checks
+		# @device_state[:power] directly so a confirmed wake terminates
+		# the wait immediately; the condvar broadcast from handle_received
+		# only serves to interrupt the 0.1s poll interval. handle_received
+		# assigns @device_state before taking @wake_mutex to broadcast, so
+		# this check (performed under the same mutex) cannot miss it.
+		deadline = monotonic_now + POWER_ON_TIMEOUT
+		@wake_mutex.synchronize do
+			while @wake_pending && !@device_state[:power] &&
+				monotonic_now < deadline
+				@wake_cond.wait(@wake_mutex, 0.1)
+			end
+		end
+		@wake_pending = false
+
+		unless @device_state[:power]
+			# Wake-up failed. Tear down state we touched and re-raise so
+			# the adapter /start-session returns non-200. Snapshot is
+			# removed so a subsequent retry starts clean.
+			@snapshot_session_powered_on = false
+			@snapshot_power_on_completed = false
+			@session = nil
+			delete_session_snapshot
+			raise RuntimeError,
+				"yamaha did not power on within #{POWER_ON_TIMEOUT}s"
+		end
+
+		# Wake-up verified. Persist the completion flag so staged restore
+		# will know to emit a final power_off at the end of the session.
+		@snapshot_power_on_completed = true
+		persist_session_snapshot(@session ? @session.first : '',
+			@session ? @session.last : {})
+	end
+
+	# Post-init / SPP-reconnect idle input sanitization.
+	#
+	# An SPP/RFCOMM reconnect can wake the YAS-207, and the device may come
+	# up with input=:bluetooth. Bluetooth AUDIO is not used in this
+	# deployment -- SPP/RFCOMM is control-only -- so :bluetooth must never
+	# be left as the idle input merely as a side effect of establishing the
+	# control connection.
+	#
+	# Guarded narrowly: a correction is applied ONLY when
+	#   - a policy input is configured (controller.idle_input_policy; the
+	#     default nil disables this feature entirely),
+	#   - the device is positively powered on,
+	#   - no session is active (this also covers session start-up, since
+	#     start_session pre-creates @session before any wake-up),
+	#   - no staged restore is in progress,
+	#   - no intent is pending (initial / manual / session commands),
+	#   - the observed input is exactly :bluetooth.
+	# The correction enqueues the set_input command plus a status report
+	# and verifies via the next device status reply; it never powers the
+	# device on or off and never mutates session or restore state. The
+	# reconnect itself -- and any wake it caused -- is a separate
+	# lifecycle observation, already visible in the DS lines; this method
+	# only corrects the input.
+	private def sanitize_idle_input
+		return if @idle_input_policy.nil?
+		return unless @state == :synced
+
+		unless @session.nil? && !@restoring_session && @intent.empty?
+			# A lifecycle transition (session start, restore, or a pending
+			# command) interrupts any in-flight correction.
+			@idle_input_correction_pending = false
+			return
+		end
+		return unless @device_state[:power] == true
+
+		if @idle_input_correction_pending
+			# A correction is in flight; each subsequent status report is
+			# the verification point.
+			if @device_state[:input] == @idle_input_policy
+				@idle_input_correction_pending = false
+				puts "+ Idle input: policy input=#{@idle_input_policy} verified"
+			elsif monotonic_now - @idle_input_correction_at >
+					IDLE_INPUT_CORRECTION_TIMEOUT
+				@idle_input_correction_pending = false
+				STDERR.puts "! Idle input: correction to #{@idle_input_policy} " +
+					"not verified within #{IDLE_INPUT_CORRECTION_TIMEOUT}s " +
+					"(input still #{@device_state[:input].inspect})"
+			end
+			return
+		end
+		return unless @device_state[:input] == :bluetooth
+
+		@idle_input_correction_pending = true
+		@idle_input_correction_at = monotonic_now
+		puts "+ Idle input: observed input=bluetooth while idle " +
+			"(powered on, no session, no restore, no pending intent); " +
+			"applying policy input=#{@idle_input_policy}"
+		enqueue(COMMANDS[:"set_input_#{@idle_input_policy}"])
+		enqueue(COMMANDS[:report_status])
 	end
 
 	# Terminate a session -- called by end users.
@@ -923,10 +1270,20 @@ class YamahaSoundbarRemote
 	# ---- session snapshot persistence (process-crash recovery) ----
 
 	private def persist_session_snapshot(name, saved)
+		persist_session_snapshot_ext(name, saved,
+			session_powered_on: @snapshot_session_powered_on,
+			power_on_completed: @snapshot_power_on_completed)
+	end
+
+	private def persist_session_snapshot_ext(name, saved,
+			session_powered_on: @snapshot_session_powered_on,
+			power_on_completed: @snapshot_power_on_completed)
 		File.write(@snapshot_path, JSON.pretty_generate({
 			'name' => name,
 			'saved_state' => saved,
 			'captured_at' => Time.now.utc.iso8601,
+			'session_powered_on' => session_powered_on ? true : false,
+			'power_on_completed' => power_on_completed ? true : false,
 		}))
 		File.chmod(0600, @snapshot_path)
 	rescue => e
@@ -947,8 +1304,15 @@ class YamahaSoundbarRemote
 		return unless name && saved
 		# Symbolize keys for parity with @device_state.
 		saved_sym = saved.each_with_object({}) { |(k, v), h| h[k.to_sym] = v }
+		# session_powered_on / power_on_completed default to false on old
+		# snapshots (backward-compatible: an old snapshot without these
+		# fields will never trigger a final power-off at restore time).
+		@snapshot_session_powered_on =
+			data.key?('session_powered_on') ? !!data['session_powered_on'] : false
+		@snapshot_power_on_completed =
+			data.key?('power_on_completed') ? !!data['power_on_completed'] : false
 		@session = [name, saved_sym]
-		puts "! Recovered session from snapshot: name=#{name}, saved=#{saved_sym.inspect}"
+		puts "! Recovered session from snapshot: name=#{name}, saved=#{saved_sym.inspect}, session_powered_on=#{@snapshot_session_powered_on}, power_on_completed=#{@snapshot_power_on_completed}"
 	rescue => e
 		STDERR.puts "! Failed to recover session snapshot: #{e}"
 	end
@@ -1051,18 +1415,20 @@ if __FILE__ == $0
 		end
 
 		# /state returns a JSON snapshot of current device state plus the
-		# session model (name, active, restoring). Used by adapters to
-		# positively confirm session-restore completion.
+		# session model (name, active, restoring, restore_phase/error,
+		# power-ownership flags). Used by adapters to positively confirm
+		# session-restore completion.
 		s.mount_proc("/state") do |req, res|
 			res['Content-Type'] = 'application/json; charset=utf-8'
 			res.body = JSON.pretty_generate({
 				'device_state' => ysr.device_state,
 				'session' => {
-					'name'      => ysr.session ? ysr.session.first : nil,
-					'active'    => !ysr.session.nil?,
-					'restoring' => ysr.restoring_session,
+					'name'          => ysr.session ? ysr.session.first : nil,
+					'active'        => !ysr.session.nil?,
+					'restoring'     => ysr.restoring_session,
 					'restore_phase' => ysr.restore_phase,
 					'restore_error' => ysr.restore_error,
+					'powered_on_by_session' => ysr.instance_variable_get(:@snapshot_power_on_completed),
 				},
 				'protocol' => {
 					'status_generation' => ysr.status_generation,

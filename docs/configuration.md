@@ -53,6 +53,7 @@ each key and example profiles.
 | `status_refresh_seconds` | int | `30` | periodic device-state poll interval |
 | `manage_power` | bool | `true` | if `false`, controller never issues `power_*` commands |
 | `initial_intent` | object | **absent → legacy** | see tri-state below |
+| `idle_input_policy` | string | **absent → disabled** | idle/post-connect input sanitization, see below |
 
 #### `controller.initial_intent` — tri-state semantics
 
@@ -65,6 +66,42 @@ each key and example profiles.
 This lets users opt in to first-sync defaults, opt out entirely (the
 recommended state for installations that already have a configured TV state),
 or keep the legacy upstream defaults without any new key.
+
+#### `controller.idle_input_policy` — idle / post-connect input sanitization
+
+An SPP/RFCOMM reconnect can wake the Yamaha, and the device may come up with
+`input: bluetooth`. In installations where Bluetooth AUDIO is not used (SPP
+stays control-only), that input must not be left as the idle state merely as
+a side effect of establishing the control connection.
+
+When set to an input name that has a `set_input_<name>` command (e.g. `"tv"`),
+the controller corrects the input — and verifies it via the next device
+status report — when **all** of the following hold at a status report:
+
+- the device is positively powered on,
+- no session is active (including session start-up),
+- no staged restore is in progress,
+- no intent is pending (initial / manual / session commands),
+- the observed input is exactly `bluetooth`.
+
+Guarantees / non-goals:
+
+- the default (key absent or `null`) disables the feature entirely —
+  upstream behaviour is preserved;
+- it never powers the device on or off (a genuinely off device is left off);
+- it only ever corrects the unwanted `bluetooth` input — any other idle
+  input (including the policy input itself, `analog`, `hdmi`, …) is
+  untouched;
+- it never interferes with an active music session, session start-up,
+  staged restoration, or crash recovery;
+- the reconnect itself — and any wake it caused — remains a separate
+  lifecycle observation in the controller log (`+ DS:` lines); the
+  sanitization is logged on its own lines
+  (`+ Idle input: … applying policy input=…` /
+  `+ Idle input: policy input=… verified`);
+- correction is bounded: if the device does not confirm the policy input
+  within `15 s`, the attempt is logged as unverified and the correction
+  simply re-arms on the next idle `bluetooth` observation.
 
 ### `session`
 
