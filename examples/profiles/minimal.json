@@ -1,0 +1,18 @@
+{
+  "_comment": [
+    "Example profile: minimal upstream-style configuration.",
+    "No audio transport or player hooks specified; useful as a starting",
+    "point for installations that already have a configured TV state",
+    "and want the controller to do nothing on first sync."
+  ],
+
+  "controller": {
+    "rfcomm_device":             "/dev/rfcomm0",
+    "http_bind":                 "127.0.0.1",
+    "http_port":                 8000,
+    "sync_timeout_seconds":      15,
+    "status_refresh_seconds":    30,
+    "manage_power":              true,
+    "initial_intent":            {}
+  }
+}

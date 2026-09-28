@@ -1,2 +1,6 @@
 .svn
 data
+
+# Python
+__pycache__
+*.pyc

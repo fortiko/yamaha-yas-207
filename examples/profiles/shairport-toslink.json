@@ -1,0 +1,40 @@
+{
+  "_comment": [
+    "Example profile: Shairport Sync over ALSA SPDIF/TOSLINK to YAS-207 TV input.",
+    "Mirrors the original upstream blog post design.",
+    "Audio-transport configuration is intentionally NOT included here --",
+    "the controller does not need to know which ALSA device the player uses."
+  ],
+
+  "controller": {
+    "rfcomm_device":             "/dev/rfcomm0",
+    "http_bind":                 "127.0.0.1",
+    "http_port":                 8000,
+    "sync_timeout_seconds":      15,
+    "status_refresh_seconds":    30,
+    "manage_power":              true,
+    "initial_intent":            {}
+  },
+
+  "session": {
+    "name":                       "airplay",
+    "music_intent": {
+      "input":      "tv",
+      "surround":   "music"
+    },
+    "stop_debounce_seconds":     0
+  },
+
+  "volume": {
+    "min_nonzero_raw":           1,
+    "max_raw":                   50,
+    "zero_is_mute":              false,
+    "default_percent":           50,
+    "remember_when_inactive":    false
+  },
+
+  "player": {
+    "type":          "shairport",
+    "audio_format":  "pcm:44100:16:2"
+  }
+}
