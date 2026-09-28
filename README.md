@@ -6,6 +6,26 @@ a Yamaha YAS-207 soundbar.
 It's part of a multi-weekend project to build an [AirPlay speaker
 using the YAS-207 and Raspberry Pi](https://wejn.org/2021/04/multi-weekend-project-reversing-yamaha-yas-207-remote-control/).
 
+## Maintained fork
+
+This is a maintained fork of
+[wejn/yamaha-yas-207](https://github.com/wejn/yamaha-yas-207), originally
+authored by Michal Jirku (wejn.org). The original reversing work
+(`reversing/`) and the `control/` core are preserved; with no
+configuration file the controller behaves identically to the original.
+
+Maintained additions:
+
+* JSON configuration with backwards-compatible defaults
+  (`docs/configuration.md`, `examples/profiles/`)
+* Staged session restore with closed-loop volume verification,
+  crash recovery via a persistent session snapshot, and a `GET /state`
+  endpoint
+* Player adapters (Sendspin, Shairport Sync) under `adapters/`; the
+  controller is audio-transport independent and none of the transports
+  are required
+* systemd deployment templates under `deployment/`
+
 ## Contents / usage
 
 For contents of the `reversing` directory see [Yamaha YAS-207's Bluetooth protocol
@@ -48,4 +68,5 @@ $ f 40 78 4a | xxd
 ## Credits
 
 * Author: Michal Jirku (wejn.org)
-* License: GNU Affero General Public License v3.0
+* Maintained fork: [fortiko/yamaha-yas-207](https://github.com/fortiko/yamaha-yas-207)
+* License: GNU Affero General Public License v3.0 (see `LICENSE`)

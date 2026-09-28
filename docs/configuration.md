@@ -46,7 +46,7 @@ each key and example profiles.
 |---|---|---|---|
 | `rfcomm_device` | string | `/dev/rfcomm0` | BT SPP serial device |
 | `rfcomm_channel` | int 1..30 | `1` | SPP channel; used if the project later owns binding |
-| `bluetooth_address` | string | **required** | MAC `XX:XX:XX:XX:XX:XX` |
+| `bluetooth_address` | string | absent (required by adapters) | MAC `XX:XX:XX:XX:XX:XX` of the unit |
 | `http_bind` | string | `127.0.0.1` | controller HTTP bind address |
 | `http_port` | int 1..65535 | `8000` | controller HTTP port |
 | `sync_timeout_seconds` | int | `15` | retry interval if SPP sync stalls |
@@ -129,8 +129,11 @@ The mapping is:
 ma_to_raw(v) = max(min_nonzero_raw, round(v * max_raw / 100))   # v > 0
 ```
 
-`max_raw` is an installation preference, NOT a YAS hardware limit. YAS
-hardware max raw is 50.
+`max_raw` is an installation preference, NOT a YAS hardware limit. The YAS
+raw volume protocol range is `0..50` (device maximum is 50); `max_raw` is
+the listening ceiling the adapter maps player volume to. Player volume
+events while no session is active (`remember_when_inactive`) update the
+remembered value only and never touch the YAS.
 
 ### `player`
 
@@ -142,7 +145,7 @@ hardware max raw is 50.
 | `audio_device` | object | **required** | see below |
 | `audio_format` | string | **required** | `codec:rate:bits:channels` |
 | `hardware_volume` | bool | `false` | adapter owns volume translation |
-| `use_mpris` | bool | `false` | matches our `~/.config/sendspin/settings-daemon.json` |
+| `use_mpris` | bool | `false` | set `false` to keep the transport off D-Bus/MPRIS (recommended for headless hosts) |
 | `hooks.start` | string | **required** | shell command for stream-start |
 | `hooks.stop` | string | **required** | shell command for stream-stop |
 | `hooks.set_volume` | string | **required** | argv form for volume events |
@@ -166,12 +169,22 @@ hardware max raw is 50.
 durable name at runtime, so the numeric index cannot drift across
 reboots or device reordering.
 
-## Configuration validation
+## Configuration validation and failure modes
 
-Both the Ruby controller and the Python adapters validate the config at
-startup. Failures log and exit non-zero.
+The Ruby controller and the Python adapters validate the config at startup,
+each to the extent it consumes it:
 
-Hard requirements (config is invalid without):
+* The **controller** reads the `controller` section (plus `session`
+  metadata for session commands). A config that fails to parse
+  (`JSON.parse` raises) is a fatal configuration error: the controller
+  prints the path and the exception to stderr and exits with code `2`.
+  Invalid `controller.idle_input_policy` values (not a non-empty string,
+  or no `set_input_<name>` command) raise `ArgumentError` at startup.
+* The **adapters** enforce the full schema, including the `player` section
+  and `controller.bluetooth_address`. Validation failures log the reason
+  and exit with code `2`.
+
+Hard requirements for adapter use (config is invalid without):
 
 * All keys marked **required** above
 * `controller.bluetooth_address` matches `^[0-9A-Fa-f]{2}(:[0-9A-Fa-f]{2}){5}$`
@@ -190,11 +203,54 @@ Cross-field rules:
 * `session.music_intent.surround` if present ∈ {`"3d"`, `tv`, `stereo`,
   `movie`, `music`, `sports`, `game`}.
 
+A controller-only installation (e.g. `examples/profiles/minimal.json`)
+needs no `player` section and no `bluetooth_address`; those fields are
+required only when an adapter runs.
+
+## Backward compatibility
+
+With no config file the controller behaves identically to upstream master:
+
+* `manage_power = true` (legacy auto-power-on path runs)
+* `initial_intent` absent (legacy `INITIAL_INTENT` is applied on first sync)
+* `rfcomm_device = /dev/rfcomm0`
+* `http_bind = 127.0.0.1`, `http_port = 8000`
+* `sync_timeout_seconds = 15`, `status_refresh_seconds = 30`
+* volume mapping defaults (`max_raw = 50`, the protocol maximum)
+
+No user-visible behaviour changes unless a config file is written.
+
+## Session snapshot, crash recovery, and staged restore
+
+* The pre-session state is captured **exactly once** per `start-session`
+  (at the first confirmed device status before the music intent is
+  applied) and persisted to
+  `/run/user/<euid>/yas207/controller/session.json`.
+* If the controller process dies mid-session, the next startup
+  rehydrates the saved state and resumes the staged restore from where
+  the previous process left off. A snapshot that is unreadable or
+  malformed is logged and ignored (the controller starts fresh, no
+  session). A successfully completed restore deletes the snapshot.
+* Staged restore ordering: `:mute` → `:volume` (closed-loop convergence
+  with bounded correction) → `:sound` (clearvoice / surround / bass
+  extension / subwoofer) → `:input` (only after volume and sound state
+  are verified) → `:post_input_volume` (re-verify, since input switches
+  can reset volume) → `:final_mute` → `:final_power`.
+* `:final_power` is the **last** restore phase. It runs only when the
+  saved state has `power: false` AND the session powered the device on
+  with `power_on_completed: true`; otherwise the device is left as-is.
+  If the process crashed before wake-up verification
+  (`power_on_completed: false`), restore is conservative and does NOT
+  emit `power_off`.
+* While a staged restore is in flight, user mutation requests (`send`,
+  `send_intent`, `start_session`, `stop_session`, `send_raw`) are
+  rejected with `RuntimeError("session restore in progress")`.
+
 ## Runtime state locations
 
 | File | Owner | Purpose |
 |---|---|---|
-| `/run/user/<euid>/yas207/state.json` | adapter | desired MA volume, session_active, pending_stop_token |
+| `/run/user/<euid>/yas207/state.json` | adapter | desired player volume, session_active, pending_stop_token |
 | `/run/user/<euid>/yas207/lock` | adapter | flock for serialising all adapter operations |
 | `/run/user/<euid>/yas207/yas207-sendspin.log` | adapter | adapter log |
 | `/run/user/<euid>/yas207/controller/session.json` | controller | persistent session snapshot (for crash recovery) |
