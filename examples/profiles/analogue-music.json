@@ -1,0 +1,62 @@
+{
+  "_comment": [
+    "Generic analogue-input music profile (a starting point, not a",
+    "recommendation): music into the YAS-207 ANALOG input with Clear",
+    "Voice off, Music surround mode, and bass extension off. Subwoofer",
+    "level is intentionally left unspecified (unconfigured fields are",
+    "never reset by the controller). Replace the player section with",
+    "your own transport's values.",
+    "Default location: ~/.config/yas207/controller.json",
+    "Override via env: YAS207_CONFIG=/absolute/path/to/controller.json",
+    "See docs/configuration.md for field semantics and docs/profiles.md",
+    "for rationale."
+  ],
+
+  "controller": {
+    "rfcomm_device":             "/dev/rfcomm0",
+    "rfcomm_channel":            1,
+    "bluetooth_address":         "02:0A:0B:0C:0D:0E",
+    "http_bind":                 "127.0.0.1",
+    "http_port":                 8000,
+    "sync_timeout_seconds":      15,
+    "status_refresh_seconds":    30,
+    "manage_power":              false,
+    "initial_intent":            {}
+  },
+
+  "session": {
+    "name":                      "music",
+    "music_intent": {
+      "input":      "analog",
+      "clearvoice": false,
+      "surround":   "music",
+      "bass_ext":   false
+    },
+    "stop_debounce_seconds":     10
+  },
+
+  "volume": {
+    "min_nonzero_raw":           1,
+    "max_raw":                   50,
+    "zero_is_mute":              true,
+    "default_percent":           50,
+    "remember_when_inactive":    true
+  },
+
+  "player": {
+    "type":        "sendspin",
+    "name":        "Yamaha Player",
+    "interface":   "192.0.2.100",
+    "audio_device": {
+      "match": "Example ALSA Device"
+    },
+    "audio_format":   "flac:48000:16:2",
+    "hardware_volume": false,
+    "use_mpris":      false,
+    "hooks": {
+      "start":      "/usr/local/sbin/yas207/yas207-sendspin start",
+      "stop":       "/usr/local/sbin/yas207/yas207-sendspin stop",
+      "set_volume": "/usr/local/sbin/yas207/yas207-sendspin volume"
+    }
+  }
+}

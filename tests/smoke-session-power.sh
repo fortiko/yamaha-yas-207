@@ -630,6 +630,30 @@ rescue ArgumentError
 end
 puts 'OK  invalid idle_input_policy values rejected at config load'
 
+# ----------------------------------------------------------------------------
+# 10. Malformed snapshot file is ignored at startup (no crash, no recovery).
+# ----------------------------------------------------------------------------
+r = YamahaSoundbarRemote.new({'controller' => {'manage_power' => false, 'power_on_for_session_starts' => true}})
+r.handle_received(:reset)
+r.handle_received([4])
+r.handle_received([0, 2, 0])
+r.handle_received(tv_state)
+r.start_session('music', {'input' => 'analog'})
+r.handle_received(tv_state)  # snapshot barrier -> snapshot file written
+File.write(r.snapshot_path, 'not json {{{')
+r2 = YamahaSoundbarRemote.new({'controller' => {'manage_power' => false, 'power_on_for_session_starts' => true}})
+r2.handle_received(:reset)
+r2.handle_received([4])
+r2.handle_received([0, 2, 0])
+r2.handle_received(tv_state)
+if r2.session.nil? && !r2.restoring_session
+  puts 'OK  malformed snapshot ignored (fresh sync, no recovery)'
+else
+  puts "FAIL malformed snapshot ignored: session=#{r2.session.inspect}"
+  $failures << 'malformed snapshot'
+end
+FileUtils.rm_f(r.snapshot_path)
+
 if $failures.empty?
   puts ''
   puts 'PASS'

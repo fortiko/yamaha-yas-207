@@ -130,6 +130,18 @@ modes.each do |expected_mode, ctrl|
   end
 end
 
+# 3. With no config file, controller falls back to upstream legacy defaults
+ENV['YAS207_CONFIG'] = '/nonexistent/path/to/controller.json'
+r_legacy = YamahaSoundbarRemote.new
+if r_legacy.instance_variable_get(:@initial_intent_mode) == :absent &&
+   r_legacy.instance_variable_get(:@manage_power) == true
+  puts \"OK  no-config -> legacy defaults\"
+else
+  puts \"FAIL no-config fallback\"
+  failures << 'no-config fallback'
+end
+ENV['YAS207_CONFIG'] = '$CONFIG'
+
 if failures.empty?
   puts ''
   puts 'PASS'

@@ -313,7 +313,7 @@ class YamahaSoundbarRemote
 		:sync_timeout, :status_refresh, :manage_power, :initial_intent_mode,
 		:initial_intent_config, :snapshot_path, :restore_error,
 		:status_generation, :volume_status_generation, :idle_input_policy,
-		:power_on_for_session_starts
+		:power_on_for_session_starts, :deferred_final_mute
 
 	# Handle packet received via serial.
 	#
