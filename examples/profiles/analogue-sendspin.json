@@ -7,29 +7,32 @@
   ],
 
   "controller": {
-    "rfcomm_device":             "/dev/rfcomm0",
-    "rfcomm_channel":            1,
-    "bluetooth_address":         "02:0A:0B:0C:0D:0E",
-    "http_bind":                 "127.0.0.1",
-    "http_port":                 8000,
-    "sync_timeout_seconds":      15,
-    "status_refresh_seconds":    30,
-    "manage_power":              false,
-    "initial_intent":            {}
+    "rfcomm_device":                    "/dev/rfcomm0",
+    "rfcomm_channel":                   1,
+    "bluetooth_address":                "02:0A:0B:0C:0D:0E",
+    "http_bind":                        "127.0.0.1",
+    "http_port":                        8000,
+    "sync_timeout_seconds":             15,
+    "status_refresh_seconds":           30,
+    "manage_power":                     false,
+    "power_on_for_session_starts":      true,
+    "initial_intent":                   {}
   },
 
   "session": {
     "name":                       "sendspin",
     "music_intent": {
       "input":      "analog",
-      "clearvoice": false
+      "clearvoice": false,
+      "surround":   "music",
+      "bass_ext":   false
     },
     "stop_debounce_seconds":     10
   },
 
   "volume": {
     "min_nonzero_raw":           1,
-    "max_raw":                   20,
+    "max_raw":                   50,
     "zero_is_mute":              true,
     "default_percent":           50,
     "remember_when_inactive":    true

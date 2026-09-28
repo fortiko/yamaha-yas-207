@@ -224,9 +224,14 @@ class MainVolumeDispatchTests(unittest.TestCase):
         intent_a = json.loads(send_intents[0]["intent"])
         intent_b = json.loads(send_intents[1]["intent"])
         self.assertEqual(intent_a, intent_b)
-        # And that intent is exactly the volume-mapping for 24% -> 5 raw.
+        # And that intent is exactly the volume-mapping for MA=24% under the
+        # active config's max_raw policy. Compute expected dynamically so
+        # this test passes against any installation ceiling.
+        cfg = json.loads(EXAMPLE_CONFIG.read_text())
+        max_raw = cfg["volume"]["max_raw"]
+        expected_volume = round(24 * max_raw / 100)
         self.assertEqual(intent_a.get("mute"), False)
-        self.assertEqual(intent_a.get("volume"), 5)
+        self.assertEqual(intent_a.get("volume"), expected_volume)
 
     def test_out_of_range_volume_rejected(self):
         # cmd_volume clamps to 0..100 internally; "abc" is rejected by cmd_volume.

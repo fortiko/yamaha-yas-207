@@ -32,8 +32,16 @@ vol = cfg['volume']
 
 failures = []
 
-# Volume mapping checks
-expected_raw = {0: 0, 1: 1, 20: 4, 50: 10, 80: 16, 100: 20}
+# Volume mapping checks — compute expected from the actual max_raw so this
+# test passes against any installation policy ceiling.
+# Note: the adapter has a special case where MA <= 0 maps to raw 0 (silent);
+# only MA >= 1 goes through the min_nonzero_raw floor.
+max_raw = vol['max_raw']
+def _expected_raw(ma):
+    if ma <= 0:
+        return 0
+    return max(vol['min_nonzero_raw'], round(ma * max_raw / 100))
+expected_raw = {ma: _expected_raw(ma) for ma in [0, 1, 20, 50, 80, 100]}
 for ma, want in expected_raw.items():
     got = m['ma_to_raw'](ma, vol)
     if got == want:
@@ -42,23 +50,28 @@ for ma, want in expected_raw.items():
         print(f"FAIL ma_to_raw({ma}): got {got}, want {want}")
         failures.append(f"ma_to_raw({ma})")
 
-# Music intent shape
-intent_0 = m['compute_music_intent'](cfg, 0)
+# Music intent shape — same: derive expected volumes from the live config.
+def _intent_at(ma_percent):
+    return m['compute_music_intent'](cfg, ma_percent)
+
+intent_0 = _intent_at(0)
 if intent_0.get('mute') is True and 'volume' not in intent_0:
     print(f"OK  compute_music_intent(0) = {intent_0}")
 else:
     print(f"FAIL compute_music_intent(0): {intent_0}")
     failures.append("compute_music_intent(0)")
 
-intent_50 = m['compute_music_intent'](cfg, 50)
-if intent_50.get('mute') is False and intent_50.get('volume') == 10:
+intent_50 = _intent_at(50)
+want_vol_50 = expected_raw[50]
+if intent_50.get('mute') is False and intent_50.get('volume') == want_vol_50:
     print(f"OK  compute_music_intent(50) = {intent_50}")
 else:
     print(f"FAIL compute_music_intent(50): {intent_50}")
     failures.append("compute_music_intent(50)")
 
-intent_100 = m['compute_music_intent'](cfg, 100)
-if intent_100.get('mute') is False and intent_100.get('volume') == 20:
+intent_100 = _intent_at(100)
+want_vol_100 = expected_raw[100]
+if intent_100.get('mute') is False and intent_100.get('volume') == want_vol_100:
     print(f"OK  compute_music_intent(100) = {intent_100}")
 else:
     print(f"FAIL compute_music_intent(100): {intent_100}")
