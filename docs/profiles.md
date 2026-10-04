@@ -68,6 +68,7 @@ change.
 | `examples/profiles/shairport-tv-optical.json` | mirrors the upstream Shairport Sync design |
 | `examples/profiles/analogue-music.json` | generic analogue-input music profile |
 | `examples/profiles/analogue-sendspin.json` | Sendspin transport over the analogue input |
+| `examples/profiles/hdmi-sendspin.json` | Sendspin transport over HDMI (maintained Music Assistant example) |
 
 All examples use synthetic placeholder values (example MAC
 `02:0A:0B:0C:0D:0E`, documentation IP `192.0.2.x`); replace them with your

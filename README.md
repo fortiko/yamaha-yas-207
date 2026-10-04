@@ -55,9 +55,11 @@ see [Configuration](#configuration).
 
 ### Music Assistant / Sendspin
 
-1. Copy `examples/profiles/analogue-sendspin.json` to
+1. Copy `examples/profiles/hdmi-sendspin.json` to
    `~/.config/yas207/controller.json` and set `bluetooth_address`,
-   `player.interface`, and `player.audio_device.match`.
+   `player.interface`, and `player.audio_device.match` to your HDMI
+   audio device. This is the maintained example: HDMI audio with
+   logical Yamaha input `hdmi`.
 2. Install `adapters/sendspin/yas207-sendspin` where Sendspin can run it
    and point Sendspin's start/stop/set-volume hooks at it (see
    `player.hooks` and `deployment/systemd/sendspin.service`).
@@ -79,6 +81,19 @@ Assistant volume changes are translated to the Yamaha raw range and
 remembered across sessions in `$XDG_STATE_HOME/yas207/sendspin-volume.json`
 (falling back to the configured default). Volume events received while no
 session is active update the remembered value without touching the soundbar.
+
+### Why profiles?
+
+A soundbar shared with a TV usually idles in a TV-oriented state — for
+example, 3D surround playback (`surround: "3d"`) with Clear Voice
+(`clearvoice`) enabled. Music over Music Assistant wants something else:
+logical input `hdmi` with a music-oriented Yamaha mode such as the Music
+surround mode (`surround: "music"`) or Stereo (2-channel) playback
+(`surround: "stereo"`), usually with Clear Voice disabled. A profile
+records the music side of that split in `session.music_intent`; when the
+Sendspin session ends after the configured stop debounce, the controller
+restores the snapshot taken before playback started, prior input and
+sound settings included.
 
 Bonus: Music Assistant's optional AirPlay Receiver plugin can expose the
 MA-managed player to phones and laptops; that receiver is handled

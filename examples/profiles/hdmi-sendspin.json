@@ -1,0 +1,60 @@
+{
+  "_comment": [
+    "Example profile: Sendspin over HDMI audio output to YAS-207 HDMI input.",
+    "Maintained Music Assistant example: HDMI audio with logical Yamaha",
+    "input `hdmi` (physical HDMI path). See analogue-sendspin.json for the",
+    "same structure over the analog input.",
+    "Default location: ~/.config/yas207/controller.json",
+    "Override via env: YAS207_CONFIG=/absolute/path/to/controller.json",
+    "See docs/configuration.md for field semantics and docs/profiles.md for rationale."
+  ],
+
+  "controller": {
+    "rfcomm_device":                    "/dev/rfcomm0",
+    "rfcomm_channel":                   1,
+    "bluetooth_address":                "02:0A:0B:0C:0D:0E",
+    "http_bind":                        "127.0.0.1",
+    "http_port":                        8000,
+    "sync_timeout_seconds":             15,
+    "status_refresh_seconds":           30,
+    "manage_power":                     false,
+    "power_on_for_session_starts":      true,
+    "initial_intent":                   {}
+  },
+
+  "session": {
+    "name":                       "sendspin",
+    "music_intent": {
+      "input":      "hdmi",
+      "clearvoice": false,
+      "surround":   "music",
+      "bass_ext":   false
+    },
+    "stop_debounce_seconds":     10
+  },
+
+  "volume": {
+    "min_nonzero_raw":           1,
+    "max_raw":                   50,
+    "zero_is_mute":              true,
+    "default_percent":           50,
+    "follow_remote_ma_volume_while_inactive":    true
+  },
+
+  "player": {
+    "type":        "sendspin",
+    "name":        "Example Room",
+    "interface":   "192.0.2.135",
+    "audio_device": {
+      "match": "Example ALSA Device"
+    },
+    "audio_format":   "flac:48000:16:2",
+    "hardware_volume": false,
+    "use_mpris":      false,
+    "hooks": {
+      "start":      "/usr/local/sbin/yas207/yas207-sendspin start",
+      "stop":       "/usr/local/sbin/yas207/yas207-sendspin stop",
+      "set_volume": "/usr/local/sbin/yas207/yas207-sendspin volume"
+    }
+  }
+}
