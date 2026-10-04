@@ -75,13 +75,11 @@ Maintained additions:
 This project is licensed under the **GNU Affero General Public License
 v3.0 (AGPL-3.0)** (see `LICENSE`). Upstream copyright and authorship are
 retained: Michal Jirku (wejn.org), original repository
-[wejn/yamaha-yas-207](https://github.com/wejn/yamaha-yas-207).
+[wejn/yamaha-yas-207](https://github.com/wejn/yamaha-yas-207), which is
+itself licensed under GNU AGPL v3.
 
-The `reversing/` directory contains original protocol-analysis scripts
-from the upstream project. The legacy helper `parse-btsnoop.rb` was
-omitted from this release because its own upstream license notice was
-uncertain (`GPL2? I don't know.`); the remaining reversing scripts are
-retained for documentation and provenance.
+This fork preserves upstream authorship and license notices and does not
+alter separate notices in individual legacy files.
 
 ## Contents / usage
 
