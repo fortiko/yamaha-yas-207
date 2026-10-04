@@ -98,6 +98,15 @@ ExecStart=.../sendspin daemon \
   --hook-set-volume /usr/local/sbin/yas207/yas207-sendspin
 ```
 
+`/usr/local/sbin/yas207/yas207-sendspin` is the canonical installed path
+of the adapter on the target host:
+
+```sh
+sudo install -Dm755 \
+  adapters/sendspin/yas207-sendspin \
+  /usr/local/sbin/yas207/yas207-sendspin
+```
+
 ## Failure / recovery
 
 * The controller's serial worker retries on `Errno::EIO` (transient

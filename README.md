@@ -55,16 +55,42 @@ see [Configuration](#configuration).
 
 ### Music Assistant / Sendspin
 
-1. Copy `examples/profiles/hdmi-sendspin.json` to
-   `~/.config/yas207/controller.json` and set `bluetooth_address`,
-   `player.interface`, and `player.audio_device.match` to your HDMI
-   audio device. This is the maintained example: HDMI audio with
-   logical Yamaha input `hdmi`.
-2. Install `adapters/sendspin/yas207-sendspin` where Sendspin can run it
-   and point Sendspin's start/stop/set-volume hooks at it (see
-   `player.hooks` and `deployment/systemd/sendspin.service`).
-3. Start the controller, then Sendspin; play something and confirm the
-   soundbar switches input and follows the MA volume.
+The maintained example plays music from Music Assistant over Sendspin
+through HDMI: while music plays, the soundbar switches to logical Yamaha
+input `hdmi` with a music-oriented profile, then restores the prior
+state afterwards.
+
+1. Create the config:
+
+   ```sh
+   mkdir -p ~/.config/yas207
+   cp examples/profiles/hdmi-sendspin.json ~/.config/yas207/controller.json
+   ```
+
+   Then set three values for your setup:
+   - `controller.bluetooth_address` — Bluetooth address of the YAS-207;
+   - `player.interface` — address Sendspin listens on (bind IP address);
+   - `player.audio_device.match` — stable ALSA device name (or prefix)
+     of your HDMI output; never a numeric index.
+
+   The profile already selects logical `hdmi`, Yamaha Music surround
+   mode, and Clear Voice off for music.
+
+2. Install the adapter at its canonical path:
+
+   ```sh
+   sudo install -Dm755 \
+     adapters/sendspin/yas207-sendspin \
+     /usr/local/sbin/yas207/yas207-sendspin
+   ```
+
+   Sendspin calls this adapter on playback start, stop, and volume
+   changes; `deployment/systemd/sendspin.service` shows the hook wiring.
+
+3. Start the controller, then Sendspin, and start playback from Music
+   Assistant. Expect the YAS-207 to switch to HDMI, apply the music
+   profile, and follow the MA volume; when playback stops, the
+   controller restores the pre-session snapshot.
 
 ## Music Assistant
 
