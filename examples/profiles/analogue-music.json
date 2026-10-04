@@ -40,7 +40,7 @@
     "max_raw":                   50,
     "zero_is_mute":              true,
     "default_percent":           50,
-    "remember_when_inactive":    true
+    "follow_remote_ma_volume_while_inactive":    true
   },
 
   "player": {

@@ -39,7 +39,7 @@ These are baked into `control/control.rb` and never read from config.
 | `volume.max_raw` | `50` | YAS hardware max, NOT a tuned preference |
 | `volume.zero_is_mute` | `false` | raw `0` is a valid Yamaha silent state |
 | `volume.default_percent` | `50` | sensible centre |
-| `volume.remember_when_inactive` | `true` | safer (memory but no YAS touch) |
+| `volume.follow_remote_ma_volume_while_inactive` | `true` | safer (memory but no YAS touch) |
 | `player.hardware_volume` | `false` | adapter-controlled volume |
 | `player.use_mpris` | `false` | defensive default |
 
@@ -65,7 +65,7 @@ change.
 | Profile | Purpose |
 |---|---|
 | `examples/profiles/minimal.json` | controller-only, upstream-style defaults (no player section) |
-| `examples/profiles/shairport-toslink.json` | mirrors the upstream Shairport Sync design |
+| `examples/profiles/shairport-tv-optical.json` | mirrors the upstream Shairport Sync design |
 | `examples/profiles/analogue-music.json` | generic analogue-input music profile |
 | `examples/profiles/analogue-sendspin.json` | Sendspin transport over the analogue input |
 
@@ -96,7 +96,7 @@ with placeholder transport values. It is a starting point, not a
 tuned recommendation: set `volume.max_raw` and the player section for
 your own installation.
 
-### `shairport-toslink.json` — original upstream design
+### `shairport-tv-optical.json` — original upstream design
 
 Mirrors the design from the upstream blog post:
 

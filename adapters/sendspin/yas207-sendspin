@@ -67,6 +67,104 @@ def runtime_dir() -> Path:
     return Path(f"/run/user/{os.getuid()}/yas207")
 
 
+def persistent_state_path() -> Path:
+    """Path of the durable per-user volume-persistence file.
+
+    Honours $XDG_STATE_HOME/yas207/sendspin-volume.json and falls back to
+    ~/.local/state/yas207/sendspin-volume.json. Overridable for tests via
+    $YAS207_PERSISTENT_VOLUME_PATH.
+    """
+    override = os.environ.get("YAS207_PERSISTENT_VOLUME_PATH")
+    if override:
+        return Path(override)
+    xdg = os.environ.get("XDG_STATE_HOME")
+    base = Path(xdg) if xdg else Path.home() / ".local" / "state"
+    return base / "yas207" / "sendspin-volume.json"
+
+
+def load_persisted_volume(log: Log) -> int | None:
+    """Return the persisted MA percent (0..100) or None on any failure.
+
+    Missing file, malformed JSON, wrong schema, non-integer, or out-of-range
+    values all collapse to None so the caller can fall back to default_percent.
+    Errors are logged at INFO so they are observable without being noisy.
+    """
+    path = persistent_state_path()
+    try:
+        raw = path.read_text()
+    except FileNotFoundError:
+        log.write("INFO", "persist", f"no persisted volume file at {path}")
+        return None
+    except OSError as e:
+        log.write("WARN", "persist", f"failed to read {path}: {e}; falling back")
+        return None
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError as e:
+        log.write("WARN", "persist", f"persisted file {path} malformed ({e}); falling back")
+        return None
+    if not isinstance(data, dict):
+        log.write("WARN", "persist", f"persisted file {path} not an object; falling back")
+        return None
+    if data.get("schema") != SCHEMA_VERSION:
+        log.write(
+            "WARN", "persist",
+            f"persisted file {path} schema={data.get('schema')!r} != {SCHEMA_VERSION}; falling back",
+        )
+        return None
+    ma = data.get("desired_ma_percent")
+    if not isinstance(ma, int) or isinstance(ma, bool) or not 0 <= ma <= 100:
+        log.write(
+            "WARN", "persist",
+            f"persisted file {path} desired_ma_percent={ma!r} invalid; falling back",
+        )
+        return None
+    return ma
+
+
+def save_persisted_volume(ma: int, log: Log) -> None:
+    """Atomically write the MA percent to the durable volume-persistence file.
+
+    Writes to a sibling .tmp file, fsyncs, then os.replace()s onto the target.
+    Parent directory is created with mode 0o700; the file ends up 0o600.
+    On any failure the previous file is left intact and a WARN is logged.
+    """
+    path = persistent_state_path()
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            os.chmod(path.parent, 0o700)
+        except OSError:
+            pass
+        payload = {"schema": SCHEMA_VERSION, "desired_ma_percent": ma}
+        tmp = path.with_suffix(path.suffix + ".tmp")
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        try:
+            with os.fdopen(fd, "w") as f:
+                json.dump(payload, f, indent=2, sort_keys=True)
+                f.flush()
+                os.fsync(f.fileno())
+        except Exception:
+            with contextlib.suppress(OSError):
+                os.unlink(tmp)
+            raise
+        os.replace(tmp, path)
+        try:
+            os.chmod(path, 0o600)
+        except OSError:
+            pass
+        dfd = os.open(path.parent, os.O_RDONLY)
+        try:
+            os.fsync(dfd)
+        except OSError:
+            pass
+        finally:
+            os.close(dfd)
+        log.write("INFO", "persist", f"persisted MA volume {ma} to {path}")
+    except OSError as e:
+        log.write("WARN", "persist", f"failed to persist MA volume to {path}: {e}")
+
+
 def load_config(path: Path | None = None) -> dict:
     cfg_path = path or Path(
         os.environ.get("YAS207_CONFIG")
@@ -135,7 +233,7 @@ def validate_config(cfg: dict) -> None:
 
     vol = cfg["volume"]
     for key in ("min_nonzero_raw", "max_raw", "zero_is_mute", "default_percent",
-                "remember_when_inactive"):
+                "follow_remote_ma_volume_while_inactive"):
         if key not in vol:
             die(f"config.volume missing required key: {key}", code=2)
     if not 1 <= vol["min_nonzero_raw"] <= 50:
@@ -329,12 +427,21 @@ def cmd_start(cfg: dict, log: Log, state: State, lock: Lock) -> int:
             log.write("INFO", "start", "session already active; reusing existing session")
             return 0
 
+        # Priority: runtime desired_ma_percent -> persisted -> configured default.
         ma = s["desired_ma_percent"]
-        if ma is None:
-            ma = cfg["volume"]["default_percent"]
-            log.write("INFO", "start", f"using default MA volume {ma} (no remembered value)")
+        if ma is not None:
+            log.write("INFO", "start", f"using runtime MA volume {ma}")
         else:
-            log.write("INFO", "start", f"using remembered MA volume {ma}")
+            persisted = load_persisted_volume(log)
+            if persisted is not None:
+                ma = persisted
+                # Populate runtime so subsequent events within the same
+                # process lifetime do not re-read the persistent file.
+                state.update(desired_ma_percent=ma)
+                log.write("INFO", "start", f"using persisted MA volume {ma}")
+            else:
+                ma = cfg["volume"]["default_percent"]
+                log.write("INFO", "start", f"using default MA volume {ma} (no remembered value)")
 
         intent = compute_music_intent(cfg, ma)
         log.write("INFO", "start", f"computed music intent: {intent}")
@@ -465,11 +572,12 @@ def cmd_volume(cfg: dict, log: Log, state: State, lock: Lock, raw_value: str) ->
 
         if not s["session_active"]:
             # INVARIANT: never contact/wake/change Yamaha while inactive.
-            if cfg["volume"]["remember_when_inactive"]:
+            if cfg["volume"]["follow_remote_ma_volume_while_inactive"]:
                 log.write(
                     "INFO", "volume",
                     f"MA={ma} remembered while inactive (no Yamaha contact)",
                 )
+                save_persisted_volume(ma, log)
             else:
                 log.write(
                     "INFO", "volume",
@@ -492,6 +600,7 @@ def cmd_volume(cfg: dict, log: Log, state: State, lock: Lock, raw_value: str) ->
         if status != 200:
             log.write("ERROR", "volume", f"upstream /send failed HTTP={status}; state preserved")
             return 1
+        save_persisted_volume(ma, log)
         return 0
 
 

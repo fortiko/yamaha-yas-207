@@ -34,7 +34,7 @@ Deployment profiles (see `examples/profiles/`):
 | Profile | Player | Audio output | YAS input |
 |---|---|---|---|
 | `analogue-sendspin.json` | Sendspin | Example ALSA Device (3.5 mm) | analog |
-| `shairport-toslink.json` | Shairport Sync | ALSA SPDIF/TOSLINK | tv |
+| `shairport-tv-optical.json` | Shairport Sync | ALSA SPDIF/TOSLINK | tv |
 | (illustrative) | any | ALSA HDMI | hdmi |
 | (illustrative) | any | HDMI -> TV -> ARC | tv |
 

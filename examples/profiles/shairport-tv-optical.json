@@ -1,6 +1,10 @@
 {
   "_comment": [
-    "Upstream-style profile: Shairport Sync over ALSA SPDIF/TOSLINK to YAS-207 TV input.",
+    "Upstream-style profile: Shairport Sync over ALSA SPDIF/TOSLINK to YAS-207.",
+    "Wired logical inputs on the YAS-207 are: analog, hdmi, tv.",
+    "The logical tv input covers any TV-source audio: physical optical/TOSLINK",
+    "(this profile) and HDMI ARC (the TV HDMI OUT (ARC) jack). Both physical",
+    "routes map to the same logical tv input on the soundbar.",
     "Mirrors the original wejn.org blog post design.",
     "Requires no Sendspin adapter; uses the upstream shairport integration scripts",
     "in adapters/shairport/ with shairport-sync.conf run_this_* directives."
@@ -32,7 +36,7 @@
     "max_raw":                   50,
     "zero_is_mute":              false,
     "default_percent":           50,
-    "remember_when_inactive":    false
+    "follow_remote_ma_volume_while_inactive":    false
   },
 
   "player": {

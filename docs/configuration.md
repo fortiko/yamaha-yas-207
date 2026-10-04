@@ -122,7 +122,7 @@ Keys in `music_intent` not listed here (e.g. `surround`, `bass_ext`,
 | `max_raw` | int ≤ 50 | `50` | music maximum; YAS hardware max is 50 |
 | `zero_is_mute` | bool | `false` | if `true`, MA `0` → upstream `{mute:true}` |
 | `default_percent` | int 0..100 | `50` | initial remembered MA volume |
-| `remember_when_inactive` | bool | `true` | if `true`, inactive volume events update remembered value but never touch the YAS |
+| `follow_remote_ma_volume_while_inactive` | bool | `true` | if `true`, inactive volume events update remembered value but never touch the YAS |
 
 The mapping is:
 ```
@@ -132,7 +132,7 @@ ma_to_raw(v) = max(min_nonzero_raw, round(v * max_raw / 100))   # v > 0
 `max_raw` is an installation preference, NOT a YAS hardware limit. The YAS
 raw volume protocol range is `0..50` (device maximum is 50); `max_raw` is
 the listening ceiling the adapter maps player volume to. Player volume
-events while no session is active (`remember_when_inactive`) update the
+events while no session is active (`follow_remote_ma_volume_while_inactive`) update the
 remembered value only and never touch the YAS.
 
 ### `player`

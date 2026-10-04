@@ -24,6 +24,7 @@ require 'thread'
 require 'webrick'
 require 'json'
 require 'fileutils'
+require 'time'
 
 # YAS-207 remote.
 #
