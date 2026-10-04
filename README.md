@@ -1,134 +1,134 @@
 # Yamaha YAS-207
 
-This repository hosts (some of) the code to remotely control
-a Yamaha YAS-207 soundbar.
+Control a Yamaha YAS-207 soundbar over Bluetooth serial from Linux — named
+sessions switch inputs, manage volume, and restore the previous state;
+Music Assistant integration is available via Sendspin.
 
-It's part of a multi-weekend project to build an [AirPlay speaker
-using the YAS-207 and Raspberry Pi](https://wejn.org/2021/04/multi-weekend-project-reversing-yamaha-yas-207-remote-control/).
+This repo coordinates the soundbar around the audio path. It does not
+implement audio transport itself.
 
-## Why this fork in 2026
+## Quick Start
 
-The original wejn.org work (2021) reverse-engineered the YAS-207 Bluetooth
-protocol and provided a minimal Ruby controller. This maintained fork
-extends that foundation into a scriptable, session-aware control layer
-suitable for modern home-audio integrations.
+### Requirements
 
-**Audio signal path (preferred/digital):** HDMI and the logical `tv` input
-(where optical/TOSLINK and HDMI ARC are physical paths to the same
-logical `tv` input) feed digital audio into the soundbar. Analog audio
-remains supported as an optional logical input/path. Bluetooth is used
-by this architecture **for Yamaha control/commands**, not as the audio
-transport; Bluetooth audio may be possible at the hardware level but is
-not the integration path this repo currently uses or tests.
-
-**Modern integrations** feed networked audio via the digital path while
-this repo handles Yamaha input/session switching, volume state, and
-restoration:
-
-- **Music Assistant + AirPlay Receiver plugin**: exposes a MA player
-  backed by the YAS-207 path as an AirPlay receiver (iPhone/macOS can
-  stream to it).
-- **Music Assistant AirPlay player provider**: MA can *send* audio to an
-  AirPlay/RAOP target (e.g., a Shairport instance driving the YAS-207
-  `tv` input).
-- **Sendspin**: direct Music Assistant integration via the Sendspin
-  adapter with persistent MA volume across sessions.
-- **Shairport Sync**: AirPlay 1/RAOP receiver driving the logical `tv`
-  input via ALSA SPDIF/TOSLINK or HDMI ARC. Shairport Sync can be built
-  with AirPlay 2 support, but MA interoperability currently has timing
-  issues with native AirPlay 2; users should choose AirPlay 1/RAOP or
-  AirPlay 2 compatibility mode. AirPlay 2 cannot be used when MA and
-  Shairport run on the same host.
-
-This repo coordinates the soundbar around the audio path; it does not
-implement AirPlay or audio transport itself.
-
-Other audio-path combinations are welcome as PRs, especially with tests
-or reproducible setup notes. Do not claim support for paths that are not
-currently tested.
-
-## Maintained fork
-
-This is a maintained fork of
-[wejn/yamaha-yas-207](https://github.com/wejn/yamaha-yas-207), originally
-authored by Michal Jirku (wejn.org). The original reversing work
-(`reversing/`) and the `control/` core are preserved; with no
-configuration file the controller behaves identically to the original.
-
-Maintained additions:
-
-* JSON configuration with backwards-compatible defaults
-  (`docs/configuration.md`, `examples/profiles/`)
-* Staged session restore with closed-loop volume verification,
-  crash recovery via a persistent session snapshot, and a `GET /state`
-  endpoint
-* Player adapters (Sendspin, Shairport Sync) under `adapters/`; the
-  controller is audio-transport independent and none of the transports
-  are required
-* Durable Music Assistant volume persistence via XDG state directory
-  (`adapters/sendspin/yas207-sendspin`)
-* HTTP API reference (`docs/http-api.md`)
-* systemd deployment templates under `deployment/`
-
-## License & AGPL compliance
-
-This project is licensed under the **GNU Affero General Public License
-v3.0 (AGPL-3.0)** (see `LICENSE`). Upstream copyright and authorship are
-retained: Michal Jirku (wejn.org), original repository
-[wejn/yamaha-yas-207](https://github.com/wejn/yamaha-yas-207), which is
-itself licensed under GNU AGPL v3.
-
-This fork preserves upstream authorship and license notices and does not
-alter separate notices in individual legacy files.
-
-## Requirements
-
+- **Linux** with BlueZ (`bt-device`, `rfcomm`) and a Bluetooth adapter
 - **Ruby** with the `serialport` gem (`gem install serialport`)
-- **Python 3** (standard library only)
-- **Linux** with BlueZ (`bt-device`, `rfcomm`) for Bluetooth serial (`/dev/rfcomm0`)
-- Runtime directory `/run/user/$UID/yas207/` provided by the user's session (systemd/logind)
+- **Python 3** (standard library only) for the Sendspin adapter
+- A user session providing `/run/user/$UID/` (systemd/logind)
 
-## Contents / usage
+### Pair and bind the soundbar
 
-For contents of the `reversing` directory see [Yamaha YAS-207's Bluetooth protocol
-reversed](https://wejn.org/2021/04/yas-207-bluetooth-protocol-reversed/).
-
-For usage instructions of the `control` directory please see [Yamaha YAS-207's
-Minimal Client (and a Soundbar Fake)](http://wejn.org/2021/04/yas-207-minimal-client-and-a-soundbar-fake/).
-
-## Minimal viable control
-
-@jmiskovic mentioned in [Issue #1](https://github.com/wejn/yamaha-yas-207/issues/1)
-that there's an easy way to get started with just shell:
-
-``` sh
-# Valid for YAS-107 (& also YAS-207)
-sudo -s
-bt-device -l | grep YAS                # find out the device address
-rfcomm bind rfcomm0 C8:84:xx:xx:xx:xx  # bind bluetooth device to /dev/rfcomm0 serial
-
-echo -en "\xCC\xAA\x03\x40\x78\x4A\xFB" > /dev/rfcomm0   # change the input to HDMI
-echo -en "\xCC\xAA\x03\x40\x78\xD1\x74" > /dev/rfcomm0   # change the input to ANALOG
-echo -en "\xCC\xAA\x03\x40\x78\x29\x1C" > /dev/rfcomm0   # change the input to BLUETOOTH
-echo -en "\xCC\xAA\x03\x40\x78\xDF\x66" > /dev/rfcomm0   # change the input to TV
-echo -en "\xCC\xAA\x03\x40\x78\x1E\x27" > /dev/rfcomm0   # volume +
-echo -en "\xCC\xAA\x03\x40\x78\x1F\x26" > /dev/rfcomm0   # volume -
-echo -en "\xCC\xAA\x03\x40\x78\x7F\xC6" > /dev/rfcomm0   # power off
+```sh
+bt-device -l | grep YAS                     # find the soundbar's address
+sudo rfcomm bind rfcomm0 C8:84:xx:xx:xx:xx  # use your address
 ```
 
-For more commands you can look at the commands in `control.rb`, but you'll have to come
-up with the checksum. So maybe:
+Binding needs privileges; for boot-time binding see
+`deployment/systemd/yas207-rfcomm-bind.service`.
 
-``` sh
-$ cd control/
-$ f(){ ruby -e '$:<<"."; require "common.rb"' \
-  -e 'print YamahaPacketCodec.encode(ARGV.map { |x| x.to_i(16) })' "$@"; }
-$ f 40 78 4a | xxd
-00000000: ccaa 0340 784a fb                        ...@xJ.
+### Test basic control
+
+Send one raw command as proof-of-life (switch input to TV):
+
+```sh
+echo -en "\xCC\xAA\x03\x40\x78\xDF\x66" > /dev/rfcomm0   # input to TV
 ```
+
+Then start the controller from the repo root and read its state:
+
+```sh
+ruby control/control.rb
+curl -fsS http://127.0.0.1:8000/state
+```
+
+Without a config file the controller keeps upstream behavior.
+
+### Configure the controller
+
+```sh
+mkdir -p ~/.config/yas207
+cp examples/profiles/minimal.json ~/.config/yas207/controller.json
+```
+
+Edit the copy for your setup. The file is also honored at `$YAS207_CONFIG`;
+see [Configuration](#configuration).
+
+### Music Assistant / Sendspin
+
+1. Copy `examples/profiles/analogue-sendspin.json` to
+   `~/.config/yas207/controller.json` and set `bluetooth_address`,
+   `player.interface`, and `player.audio_device.match`.
+2. Install `adapters/sendspin/yas207-sendspin` where Sendspin can run it
+   and point Sendspin's start/stop/set-volume hooks at it (see
+   `player.hooks` and `deployment/systemd/sendspin.service`).
+3. Start the controller, then Sendspin; play something and confirm the
+   soundbar switches input and follows the MA volume.
+
+## Music Assistant
+
+Sendspin is the player this repo integrates with. On stream start and stop
+(with a configurable debounce), Sendspin invokes
+`adapters/sendspin/yas207-sendspin`, which opens and closes a named
+session on the controller (`/start-session`, `/stop-session`). Starting a
+session snapshots the soundbar state and applies the configured music
+intent; stopping it restores the snapshot in stages, volume first and
+power last.
+
+While a session is active the adapter owns volume and mute: Music
+Assistant volume changes are translated to the Yamaha raw range and
+remembered across sessions in `$XDG_STATE_HOME/yas207/sendspin-volume.json`
+(falling back to the configured default). Volume events received while no
+session is active update the remembered value without touching the soundbar.
+
+Bonus: Music Assistant's optional AirPlay Receiver plugin can expose the
+MA-managed player to phones and laptops; that receiver is handled
+entirely by Music Assistant, not by this repo.
+
+## What this fork adds
+
+- JSON configuration with upstream-compatible defaults
+  (`docs/configuration.md`, `examples/profiles/`)
+- Session snapshot, staged restore, and crash recovery, plus a
+  `GET /state` endpoint (`docs/http-api.md`)
+- Sendspin player adapter (`adapters/sendspin/yas207-sendspin`) with
+  persistent Music Assistant volume; the controller itself stays
+  audio-transport independent
+- Example profiles (`examples/profiles/`) and systemd units (`deployment/`)
+
+## Audio paths
+
+The wired logical inputs are `analog`, `hdmi`, and `tv`; physical
+optical/TOSLINK and HDMI ARC connections both arrive as logical `tv`.
+Bluetooth here carries Yamaha control commands over serial (RFCOMM); it
+is not the maintained audio transport.
+
+## Configuration
+
+All behavior beyond upstream defaults lives in one JSON file
+(`~/.config/yas207/controller.json`, or `$YAS207_CONFIG`); see
+`docs/configuration.md`, `docs/profiles.md`, and `examples/profiles/`.
+
+## Repository layout
+
+- `control/` — Ruby controller (device protocol, session model, HTTP API)
+- `adapters/sendspin/` — Sendspin hook adapter (session and volume bridge)
+- `deployment/` — systemd units and install notes (`deployment/README.md`)
+- `docs/` — configuration, profiles, HTTP API, compatibility notes
+- `examples/profiles/` — ready-to-copy JSON profiles
+- `reversing/` — original Bluetooth protocol reversing helpers
+- `tests/` — smoke suites and adapter dispatch tests
+
+## Background
+
+Michal Jirku reverse-engineered the YAS-207 Bluetooth protocol in 2021 and
+published a minimal Ruby controller ([project write-up](https://wejn.org/2021/04/multi-weekend-project-reversing-yamaha-yas-207-remote-control/),
+[protocol notes](https://wejn.org/2021/04/yas-207-bluetooth-protocol-reversed/)).
+This fork keeps that work (`reversing/`, `control/` core) and adds
+configuration, sessions, and player integration on top.
 
 ## Credits
 
-* Author: Michal Jirku (wejn.org)
-* Maintained fork: [fortiko/yamaha-yas-207](https://github.com/fortiko/yamaha-yas-207)
-* License: GNU Affero General Public License v3.0 (see `LICENSE`)
+- Original work: Michal Jirku ([wejn.org](https://wejn.org)) —
+  [wejn/yamaha-yas-207](https://github.com/wejn/yamaha-yas-207)
+- Maintained fork: [fortiko/yamaha-yas-207](https://github.com/fortiko/yamaha-yas-207)
+- License: GNU AGPL v3.0 — see `LICENSE`.
