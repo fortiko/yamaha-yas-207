@@ -7,8 +7,8 @@ Wants=yas207-controller.service
 
 [Service]
 Type=simple
-Environment=PATH=/opt/sendspin/bin:/usr/local/bin:/usr/bin:/bin
-ExecStart=/opt/sendspin/bin/sendspin daemon --name "Example Room" --interface 192.0.2.135 --audio-device "Example ALSA Device" --audio-format flac:48000:16:2 --hardware-volume false --hook-start /usr/local/sbin/yas207/yas207-sendspin --hook-stop /usr/local/sbin/yas207/yas207-sendspin --hook-set-volume /usr/local/sbin/yas207/yas207-sendspin --log-level INFO --disable-mpris
+Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin
+ExecStart=%h/.local/bin/sendspin daemon --name "Yamaha YAS-207" --interface 192.0.2.135 --audio-device "Example ALSA Device" --audio-format flac:48000:16:2 --hardware-volume false --hook-start /usr/local/sbin/yas207/yas207-sendspin --hook-stop /usr/local/sbin/yas207/yas207-sendspin --hook-set-volume /usr/local/sbin/yas207/yas207-sendspin --log-level INFO --disable-mpris
 Restart=always
 RestartSec=5
 TimeoutStartSec=30
@@ -21,7 +21,7 @@ NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=full
 ProtectHome=read-only
-ReadWritePaths=/run/user/%U /home/yas207/.config/sendspin
+ReadWritePaths=/run/user/%U %h/.config/sendspin
 RestrictNamespaces=true
 RestrictRealtime=true
 

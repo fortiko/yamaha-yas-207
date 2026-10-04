@@ -4,20 +4,20 @@ Documentation=https://github.com/fortiko/yamaha-yas-207
 After=bluetooth.service bluetooth.target
 Wants=bluetooth.service bluetooth.target
 
-# Verified for the example installation:
-#   MAC:     02:0A:0B:0C:0D:0E
-#   channel: 1 (SPP)
-# Override at install time by dropping a drop-in at
-# /etc/systemd/system/yas207-rfcomm-bind.service.d/.
+# Configure the real soundbar address before enabling. Create
+# /etc/default/yas207 with your values, for example:
+#   YAS207_BT_MAC=C8:84:xx:xx:xx:xx
+#   YAS207_RFCOMM_CHANNEL=1
+#   YAS207_RFCOMM_DEV=/dev/rfcomm0
+# The unit deliberately has no defaults: it fails clearly if the file or
+# any value is missing, instead of binding a placeholder address.
 StartLimitBurst=10
 StartLimitIntervalSec=60
 
 [Service]
 Type=oneshot
 RemainAfterExit=yes
-Environment=YAS207_BT_MAC=02:0A:0B:0C:0D:0E
-Environment=YAS207_RFCOMM_CHANNEL=1
-Environment=YAS207_RFCOMM_DEV=/dev/rfcomm0
+EnvironmentFile=/etc/default/yas207
 ExecStart=/usr/bin/rfcomm bind ${YAS207_RFCOMM_DEV} ${YAS207_BT_MAC} ${YAS207_RFCOMM_CHANNEL}
 # The bind may transiently fail if the YAS has just powered on or the
 # BlueZ discovery cache is stale; retry briefly.

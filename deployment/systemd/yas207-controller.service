@@ -9,8 +9,8 @@ Wants=bluetooth.target
 
 [Service]
 Type=simple
-WorkingDirectory=/home/yas207/src/yamaha-yas-207
-Environment=YAS207_CONFIG=/home/yas207/.config/yas207/controller.json
+WorkingDirectory=%h/src/yamaha-yas-207
+Environment=YAS207_CONFIG=%h/.config/yas207/controller.json
 # Runtime dir is /run/user/<euid>/yas207 (resolved by the controller
 # itself from Process.euid); no override required here.
 ExecStart=/usr/bin/ruby control/control.rb
