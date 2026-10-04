@@ -51,7 +51,9 @@ sendspin --help
 
 ### 3. Pair the YAS-207 over Bluetooth
 
-Put the soundbar into Bluetooth pairing/discoverable mode, then run:
+Put the soundbar into Bluetooth pairing/discoverable mode by pressing and holding the BLUETOOTH key on the YAS-207 remote for more than 3 seconds; the Bluetooth indicator flashes; the soundbar is then waiting for a Bluetooth connection.
+
+Then run:
 
 ```sh
 bluetoothctl
