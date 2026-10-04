@@ -27,15 +27,18 @@ restoration:
 
 - **Music Assistant + AirPlay Receiver plugin**: exposes a MA player
   backed by the YAS-207 path as an AirPlay receiver (iPhone/macOS can
-  stream to it). AirPlay 1/RAOP compatibility mode via Shairport Sync is
-  typically required; AirPlay 2 is not supported by Shairport.
+  stream to it).
 - **Music Assistant AirPlay player provider**: MA can *send* audio to an
   AirPlay/RAOP target (e.g., a Shairport instance driving the YAS-207
   `tv` input).
 - **Sendspin**: direct Music Assistant integration via the Sendspin
   adapter with persistent MA volume across sessions.
 - **Shairport Sync**: AirPlay 1/RAOP receiver driving the logical `tv`
-  input via ALSA SPDIF/TOSLINK or HDMI ARC.
+  input via ALSA SPDIF/TOSLINK or HDMI ARC. Shairport Sync can be built
+  with AirPlay 2 support, but MA interoperability currently has timing
+  issues with native AirPlay 2; users should choose AirPlay 1/RAOP or
+  AirPlay 2 compatibility mode. AirPlay 2 cannot be used when MA and
+  Shairport run on the same host.
 
 This repo coordinates the soundbar around the audio path; it does not
 implement AirPlay or audio transport itself.
@@ -70,16 +73,15 @@ Maintained additions:
 ## License & AGPL compliance
 
 This project is licensed under the **GNU Affero General Public License
-v3.0** (see `LICENSE`). Upstream copyright and authorship are retained:
-Michal Jirku (wejn.org).
+v3.0 (AGPL-3.0)** (see `LICENSE`). Upstream copyright and authorship are
+retained: Michal Jirku (wejn.org), original repository
+[wejn/yamaha-yas-207](https://github.com/wejn/yamaha-yas-207).
 
 The `reversing/` directory contains original protocol-analysis scripts
-from the upstream project. One file (`reversing/parse-btsnoop.rb`) carries
-an ambiguous license note (`GPL2? I don't know.`); its provenance and
-license are inherited from upstream and are not relicensed by this fork.
-If distributing the repository as a whole under AGPL-3.0 creates a
-compliance concern for that file, treat it as upstream-legacy material
-with uncertain licensing.
+from the upstream project. The legacy helper `parse-btsnoop.rb` was
+omitted from this release because its own upstream license notice was
+uncertain (`GPL2? I don't know.`); the remaining reversing scripts are
+retained for documentation and provenance.
 
 ## Contents / usage
 
