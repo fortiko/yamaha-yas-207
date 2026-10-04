@@ -3,3 +3,14 @@ data
 __pycache__
 *.pyc
 *.pyo
+
+# Backup files (prevent accidental commits of editor/operation backups)
+*.bak
+*.bak-*
+*.bak.*
+*~
+*.swp
+*.tmp
+
+# OS noise
+.DS_Store
