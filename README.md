@@ -1,36 +1,21 @@
 # Yamaha YAS-207
 
-Control a Yamaha YAS-207 soundbar over Bluetooth serial from Linux — named
-sessions switch inputs, manage volume, and restore the previous state;
-Music Assistant integration is available via Sendspin.
+A small controller for the Yamaha YAS-207 soundbar, with a practical Music Assistant + Sendspin setup.
 
-This repo coordinates the soundbar around the audio path. It does not
-implement audio transport itself.
+The maintained example uses:
 
-You don't need a full PC or server: a small Raspberry Pi on the same LAN
-can be the dedicated controller and player. One compact example is a
-Raspberry Pi Zero 2 W (Wi-Fi, Bluetooth 4.2/BLE, mini-HDMI); larger Pi
-models are fine too.
+- **Bluetooth** to control the YAS-207;
+- **HDMI** for Music Assistant audio;
+- **Sendspin** as the Music Assistant player;
+- a small controller profile so music can use different Yamaha sound settings from TV.
+
+This does not need a full PC or server. Any small Linux system with Bluetooth, network access and HDMI audio can do the job. A **Raspberry Pi Zero 2 W** is a compact example; larger Raspberry Pi models are fine too.
 
 ## Quick Start
 
-### Requirements
+The commands below are written for Debian / Raspberry Pi OS.
 
-- **Linux** with Bluetooth (`bluetoothctl`, `bt-device`, `rfcomm`), a
-  Bluetooth adapter, and network access
-- **Ruby** with the `serialport` gem, **Python 3** (standard library),
-  `git`, and `curl`
-- A user session providing `/run/user/$UID/` (systemd/logind)
-
-On Debian/Raspberry Pi OS, install the documented tooling with:
-
-```sh
-sudo apt-get update && sudo apt-get install -y \
-  git curl ruby ruby-dev build-essential bluez libportaudio2
-gem install serialport
-```
-
-### Get the code
+### 1. Clone the repository
 
 ```sh
 mkdir -p ~/src
@@ -38,196 +23,270 @@ git clone https://github.com/fortiko/yamaha-yas-207.git ~/src/yamaha-yas-207
 cd ~/src/yamaha-yas-207
 ```
 
-The units and examples below assume this checkout path.
+### 2. Install the basic dependencies
 
-### Install uv and Sendspin
+```sh
+sudo apt update
+sudo apt install -y \
+  git curl bluez \
+  ruby ruby-dev build-essential \
+  libportaudio2
+```
+
+Install the Ruby serial-port library used by the controller:
+
+```sh
+gem install serialport
+```
+
+Install `uv`, then Sendspin:
 
 ```sh
 curl -LsSf https://astral.sh/uv/install.sh | sh
-export PATH="$HOME/.local/bin:$PATH"   # current shell; the installer updates future shells
+export PATH="$HOME/.local/bin:$PATH"
+
 uv tool install sendspin
+sendspin --help
 ```
 
-### Pair and bind the soundbar
+### 3. Pair the YAS-207 over Bluetooth
 
-Put the soundbar in Bluetooth pairing/discoverable mode, then pair, trust,
-and bind it (use your address from discovery):
+Put the soundbar into Bluetooth pairing/discoverable mode, then run:
 
 ```sh
-bt-device -l | grep YAS                     # find the soundbar's address
-bluetoothctl pair C8:84:xx:xx:xx:xx        # use your address
-bluetoothctl trust C8:84:xx:xx:xx:xx       # use your address
-sudo rfcomm bind rfcomm0 C8:84:xx:xx:xx:xx  # use your address
+bluetoothctl
 ```
 
-Binding needs privileges; for boot-time binding see
-`deployment/systemd/yas207-rfcomm-bind.service`.
+Inside `bluetoothctl`:
 
-### Configure the controller
+```text
+power on
+scan on
+```
 
-Find this machine's LAN address and your HDMI audio output:
+Wait for the YAS-207 to appear and note its Bluetooth address, for example:
+
+```text
+AA:BB:CC:DD:EE:FF
+```
+
+Then:
+
+```text
+pair AA:BB:CC:DD:EE:FF
+trust AA:BB:CC:DD:EE:FF
+quit
+```
+
+Bind the Yamaha serial-control channel:
+
+```sh
+sudo rfcomm bind /dev/rfcomm0 AA:BB:CC:DD:EE:FF 1
+```
+
+### 4. Find this machine's LAN address and HDMI audio device
+
+Find the LAN address that Music Assistant can reach:
 
 ```sh
 ip -br addr
+```
+
+Then list the audio devices Sendspin can use:
+
+```sh
 sendspin audio-devices list
 ```
 
-Copy the maintained HDMI profile and set three values for your setup:
+Note the HDMI device you want Sendspin to use.
+
+### 5. Create the Yamaha / Sendspin profile
 
 ```sh
 mkdir -p ~/.config/yas207
-cp examples/profiles/hdmi-sendspin.json ~/.config/yas207/controller.json
+cp examples/profiles/hdmi-sendspin.json \
+  ~/.config/yas207/controller.json
 ```
 
-- `controller.bluetooth_address` — Bluetooth address of the YAS-207;
-- `player.interface` — this machine's LAN address (bind IP address);
-- `player.audio_device.match` — stable ALSA device name (or prefix)
-  of your HDMI output; never a numeric index.
-
-The profile already selects logical `hdmi`, Yamaha Music surround mode,
-and Clear Voice off for music. The file is also honored at
-`$YAS207_CONFIG`; see [Configuration](#configuration).
-
-### Test basic control
-
-Send one raw command as proof-of-life (switch input to HDMI):
+Edit:
 
 ```sh
-echo -en "\xCC\xAA\x03\x40\x78\x4A\xFB" > /dev/rfcomm0   # input to HDMI
+nano ~/.config/yas207/controller.json
 ```
 
-Then start the controller from the repo root and read its state:
+Set:
+
+- `controller.bluetooth_address` to the YAS-207 Bluetooth address;
+- `player.interface` to this machine's LAN IP address;
+- `player.audio_device.match` to the HDMI device reported by Sendspin.
+
+The supplied profile already uses the Yamaha logical input `hdmi`, the **Music** surround mode, and **Clear Voice** off while music is playing.
+
+### 6. Install the Sendspin adapter
 
 ```sh
-cd ~/src/yamaha-yas-207
+sudo install -Dm755 \
+  adapters/sendspin/yas207-sendspin \
+  /usr/local/sbin/yas207/yas207-sendspin
+```
+
+The adapter connects Sendspin's playback lifecycle and volume changes to the Yamaha controller.
+
+### 7. Start the Yamaha controller
+
+From the repository root:
+
+```sh
 ruby control/control.rb
+```
+
+Leave it running.
+
+You can check the controller from another terminal:
+
+```sh
 curl -fsS http://127.0.0.1:8000/state
 ```
 
-The controller reads `~/.config/yas207/controller.json` on start; with
-no config file it keeps upstream behavior.
+### 8. Start Sendspin
 
-### Music Assistant / Sendspin
+Use the same LAN address and HDMI device that you put in the profile:
 
-With the HDMI profile configured above, the maintained path plays music
-from Music Assistant over Sendspin: while music plays, the soundbar
-switches to logical Yamaha input `hdmi` with the music profile, then
-restores the prior state afterwards.
+```sh
+sendspin daemon \
+  --name "Yamaha YAS-207" \
+  --interface <THIS-MACHINE-IP> \
+  --audio-device "<YOUR-HDMI-AUDIO-DEVICE>" \
+  --audio-format flac:48000:16:2 \
+  --hardware-volume false \
+  --hook-start /usr/local/sbin/yas207/yas207-sendspin \
+  --hook-stop /usr/local/sbin/yas207/yas207-sendspin \
+  --hook-set-volume /usr/local/sbin/yas207/yas207-sendspin \
+  --log-level INFO \
+  --disable-mpris
+```
 
-1. Install the adapter at its canonical path:
+For example, replace `<THIS-MACHINE-IP>` with `192.168.1.50` and `<YOUR-HDMI-AUDIO-DEVICE>` with the HDMI device shown by `sendspin audio-devices list`.
 
-   ```sh
-   sudo install -Dm755 \
-     adapters/sendspin/yas207-sendspin \
-     /usr/local/sbin/yas207/yas207-sendspin
-   ```
+### 9. Play music
 
-   Sendspin calls this adapter on playback start, stop, and volume
-   changes; `deployment/systemd/sendspin.service` shows the hook wiring.
+With Music Assistant on the same network, the Sendspin player should normally appear automatically.
 
-2. With the controller running (see Test basic control above), start the
-   real Sendspin daemon with your values:
+If Sendspin asks for pairing, keep the Sendspin terminal visible: it will show the pairing information needed to complete setup in Music Assistant.
 
-   ```sh
-   sendspin daemon --name "Yamaha YAS-207" --interface <pi-lan-ip> \
-     --audio-device "<HDMI ALSA name>" --audio-format flac:48000:16:2 \
-     --hardware-volume false \
-     --hook-start /usr/local/sbin/yas207/yas207-sendspin \
-     --hook-stop /usr/local/sbin/yas207/yas207-sendspin \
-     --hook-set-volume /usr/local/sbin/yas207/yas207-sendspin \
-     --disable-mpris --log-level INFO
-   ```
+Select **Yamaha YAS-207** in Music Assistant and play something.
 
-3. In Music Assistant on the same LAN, the player should appear
-   automatically. If Sendspin asks to pair, keep the daemon terminal
-   visible, take the PIN it prints, and complete pairing for that player
-   in Music Assistant.
+During playback the soundbar should:
 
-4. Play music. Expect the YAS-207 to switch to HDMI, apply the music
-   profile, and follow the MA volume; when playback stops and the stop
-   debounce expires, the controller restores the pre-session snapshot.
+- switch to HDMI;
+- apply the music settings from the profile;
+- follow Music Assistant volume.
 
-Once this works manually, use the supplied systemd units for
-persistence: `deployment/README.md`.
+When playback stops and the configured stop debounce expires, the controller restores the Yamaha state that was present before the music session started.
+
+### 10. Make it persistent
+
+Once the manual setup works, use the supplied systemd units for automatic startup:
+
+[deployment/README.md](deployment/README.md)
+
+Get the manual path working first; systemd should only make that working setup persistent.
 
 ## Music Assistant
 
-Sendspin is the player this repo integrates with. On stream start and stop
-(with a configurable debounce), Sendspin invokes
-`adapters/sendspin/yas207-sendspin`, which opens and closes a named
-session on the controller (`/start-session`, `/stop-session`). Starting a
-session snapshots the soundbar state and applies the configured music
-intent; stopping it restores the snapshot in stages, volume first and
-power last.
+The maintained setup is:
 
-While a session is active the adapter owns volume and mute: Music
-Assistant volume changes are translated to the Yamaha raw range and
-remembered across sessions in `$XDG_STATE_HOME/yas207/sendspin-volume.json`
-(falling back to the configured default). Volume events received while no
-session is active update the remembered value without touching the soundbar.
+```text
+Music Assistant
+      |
+      v
+   Sendspin
+      |
+      v
+ HDMI audio
+      |
+      v
+ Yamaha YAS-207
+```
+
+Bluetooth is used for Yamaha control commands. It is not the audio transport in this setup.
 
 ### Why profiles?
 
-A soundbar shared with a TV usually idles in a TV-oriented state — for
-example, official Yamaha 3D surround playback with Clear Voice enabled.
-Music over Music Assistant wants something else: logical input `hdmi`
-with Music surround mode or Stereo (2-channel) playback, usually with
-Clear Voice off. A profile records the music side of that split in
-`session.music_intent`; when the Sendspin session stops after the
-configured stop debounce, the controller restores the snapshot taken
-before playback started, prior input and sound settings included.
+A soundbar used for both TV and music often benefits from different settings for each job.
 
-Bonus: Music Assistant's optional AirPlay Receiver plugin can expose the
-MA-managed player to phones and laptops; that receiver is handled
-entirely by Music Assistant, not by this repo.
+For example, the YAS-207 may spend most of its time on TV with Yamaha **3D surround playback** and **Clear Voice** enabled. Those settings can work well for dialogue, but they are not necessarily what you want for music.
+
+For Music Assistant, the profile can temporarily switch to the logical `hdmi` input and use Yamaha's **Music** surround mode or **Stereo (2-channel) playback**, usually with **Clear Voice** disabled.
+
+When the Sendspin session ends, the controller restores the snapshot captured before playback started, including the previous input and sound settings. There is no separate hard-coded "TV preset" to maintain.
+
+Music Assistant can also expose an AirPlay Receiver player if you enable that plugin; this is separate from the Yamaha control path described here.
 
 ## What this fork adds
 
-- JSON configuration with upstream-compatible defaults
-  (`docs/configuration.md`, `examples/profiles/`)
-- Session snapshot, staged restore, and crash recovery, plus a
-  `GET /state` endpoint (`docs/http-api.md`)
-- Sendspin player adapter (`adapters/sendspin/yas207-sendspin`) with
-  persistent Music Assistant volume; the controller itself stays
-  audio-transport independent
-- Example profiles (`examples/profiles/`) and systemd units (`deployment/`)
+Compared with the original reverse-engineering project, this fork adds a small controller and deployment layer around the discovered YAS-207 protocol:
+
+- HTTP control and state API;
+- configurable Yamaha state intents;
+- session snapshot and restore;
+- Sendspin start/stop/volume integration;
+- persistent Music Assistant volume;
+- systemd deployment examples;
+- example profiles for common audio paths.
+
+The reverse-engineered Yamaha protocol remains the foundation.
 
 ## Audio paths
 
-The wired logical inputs are `analog`, `hdmi`, and `tv`; physical
-optical/TOSLINK and HDMI ARC connections both arrive as logical `tv`.
-Bluetooth here carries Yamaha control commands over serial (RFCOMM); it
-is not the maintained audio transport.
+The controller recognises three wired Yamaha inputs:
+
+- `hdmi` — the maintained Music Assistant / Sendspin example;
+- `tv` — the Yamaha logical TV input, used by optical/TOSLINK or HDMI ARC;
+- `analog` — supported as an alternative analog music path.
+
+Bluetooth is separate and is used here for Yamaha control.
 
 ## Configuration
 
-All behavior beyond upstream defaults lives in one JSON file
-(`~/.config/yas207/controller.json`, or `$YAS207_CONFIG`); see
-`docs/configuration.md`, `docs/profiles.md`, and `examples/profiles/`.
-For controller-only use without a player, start from
-`examples/profiles/minimal.json`.
+The main example used by this README is:
+
+```text
+examples/profiles/hdmi-sendspin.json
+```
+
+Copy it to:
+
+```text
+~/.config/yas207/controller.json
+```
+
+For the complete configuration reference, see:
+
+- [docs/configuration.md](docs/configuration.md)
+- [docs/profiles.md](docs/profiles.md)
+- [docs/http-api.md](docs/http-api.md)
+- [docs/compatibility.md](docs/compatibility.md)
 
 ## Repository layout
 
-- `control/` — Ruby controller (device protocol, session model, HTTP API)
-- `adapters/sendspin/` — Sendspin hook adapter (session and volume bridge)
-- `deployment/` — systemd units and install notes (`deployment/README.md`)
-- `docs/` — configuration, profiles, HTTP API, compatibility notes
-- `examples/profiles/` — ready-to-copy JSON profiles
-- `reversing/` — original Bluetooth protocol reversing helpers
-- `tests/` — smoke suites and adapter dispatch tests
+```text
+control/                 Yamaha controller and HTTP API
+adapters/sendspin/       Sendspin integration
+examples/profiles/       Example controller profiles
+deployment/systemd/      systemd unit examples
+docs/                    Configuration and protocol documentation
+reversing/               Original protocol-research helpers
+```
 
 ## Background
 
-Michal Jirku reverse-engineered the YAS-207 Bluetooth protocol in 2021 and
-published a minimal Ruby controller ([project write-up](https://wejn.org/2021/04/multi-weekend-project-reversing-yamaha-yas-207-remote-control/),
-[protocol notes](https://wejn.org/2021/04/yas-207-bluetooth-protocol-reversed/)).
-This fork keeps that work (`reversing/`, `control/` core) and adds
-configuration, sessions, and player integration on top.
+The YAS-207 exposes useful control over its Bluetooth serial interface, including power, input, volume and sound settings.
+
+The original project reverse-engineered that protocol. This fork keeps that work and adds enough state management and player integration to use the soundbar as part of a modern Music Assistant setup without changing the soundbar itself.
 
 ## Credits
 
-- Original work: Michal Jirku ([wejn.org](https://wejn.org)) —
-  [wejn/yamaha-yas-207](https://github.com/wejn/yamaha-yas-207)
-- Maintained fork: [fortiko/yamaha-yas-207](https://github.com/fortiko/yamaha-yas-207)
-- License: GNU AGPL v3.0 — see `LICENSE`.
+Original Yamaha YAS-207 reverse engineering and protocol work by **Michal Jirku / wejn.org**.
+
+This repository is licensed under the **GNU Affero General Public License v3.0**; see [LICENSE](LICENSE).
