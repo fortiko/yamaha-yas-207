@@ -6,6 +6,44 @@ a Yamaha YAS-207 soundbar.
 It's part of a multi-weekend project to build an [AirPlay speaker
 using the YAS-207 and Raspberry Pi](https://wejn.org/2021/04/multi-weekend-project-reversing-yamaha-yas-207-remote-control/).
 
+## Why this fork in 2026
+
+The original wejn.org work (2021) reverse-engineered the YAS-207 Bluetooth
+protocol and provided a minimal Ruby controller. This maintained fork
+extends that foundation into a scriptable, session-aware control layer
+suitable for modern home-audio integrations.
+
+**Audio signal path (preferred/digital):** HDMI and the logical `tv` input
+(where optical/TOSLINK and HDMI ARC are physical paths to the same
+logical `tv` input) feed digital audio into the soundbar. Analog audio
+remains supported as an optional logical input/path. Bluetooth is used
+by this architecture **for Yamaha control/commands**, not as the audio
+transport; Bluetooth audio may be possible at the hardware level but is
+not the integration path this repo currently uses or tests.
+
+**Modern integrations** feed networked audio via the digital path while
+this repo handles Yamaha input/session switching, volume state, and
+restoration:
+
+- **Music Assistant + AirPlay Receiver plugin**: exposes a MA player
+  backed by the YAS-207 path as an AirPlay receiver (iPhone/macOS can
+  stream to it). AirPlay 1/RAOP compatibility mode via Shairport Sync is
+  typically required; AirPlay 2 is not supported by Shairport.
+- **Music Assistant AirPlay player provider**: MA can *send* audio to an
+  AirPlay/RAOP target (e.g., a Shairport instance driving the YAS-207
+  `tv` input).
+- **Sendspin**: direct Music Assistant integration via the Sendspin
+  adapter with persistent MA volume across sessions.
+- **Shairport Sync**: AirPlay 1/RAOP receiver driving the logical `tv`
+  input via ALSA SPDIF/TOSLINK or HDMI ARC.
+
+This repo coordinates the soundbar around the audio path; it does not
+implement AirPlay or audio transport itself.
+
+Other audio-path combinations are welcome as PRs, especially with tests
+or reproducible setup notes. Do not claim support for paths that are not
+currently tested.
+
 ## Maintained fork
 
 This is a maintained fork of
@@ -24,7 +62,24 @@ Maintained additions:
 * Player adapters (Sendspin, Shairport Sync) under `adapters/`; the
   controller is audio-transport independent and none of the transports
   are required
+* Durable Music Assistant volume persistence via XDG state directory
+  (`adapters/sendspin/yas207-sendspin`)
+* HTTP API reference (`docs/http-api.md`)
 * systemd deployment templates under `deployment/`
+
+## License & AGPL compliance
+
+This project is licensed under the **GNU Affero General Public License
+v3.0** (see `LICENSE`). Upstream copyright and authorship are retained:
+Michal Jirku (wejn.org).
+
+The `reversing/` directory contains original protocol-analysis scripts
+from the upstream project. One file (`reversing/parse-btsnoop.rb`) carries
+an ambiguous license note (`GPL2? I don't know.`); its provenance and
+license are inherited from upstream and are not relicensed by this fork.
+If distributing the repository as a whole under AGPL-3.0 creates a
+compliance concern for that file, treat it as upstream-legacy material
+with uncertain licensing.
 
 ## Contents / usage
 
