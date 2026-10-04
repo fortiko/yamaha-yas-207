@@ -81,6 +81,13 @@ itself licensed under GNU AGPL v3.
 This fork preserves upstream authorship and license notices and does not
 alter separate notices in individual legacy files.
 
+## Requirements
+
+- **Ruby** with the `serialport` gem (`gem install serialport`)
+- **Python 3** (standard library only)
+- **Linux** with BlueZ (`bt-device`, `rfcomm`) for Bluetooth serial (`/dev/rfcomm0`)
+- Runtime directory `/run/user/$UID/yas207/` provided by the user's session (systemd/logind)
+
 ## Contents / usage
 
 For contents of the `reversing` directory see [Yamaha YAS-207's Bluetooth protocol
