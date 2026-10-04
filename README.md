@@ -84,7 +84,20 @@ Bind the Yamaha serial-control channel:
 sudo rfcomm bind /dev/rfcomm0 AA:BB:CC:DD:EE:FF 1
 ```
 
-### 4. Find this machine's LAN address and HDMI audio device
+### 4. Check the control connection
+
+Start the controller and send a single command to switch the soundbar input:
+
+```sh
+ruby control/control.rb &
+curl -fsS -X POST --data-urlencode 'intent={"input":"hdmi"}' http://127.0.0.1:8000/send
+```
+
+The response `send intent: {:input=>:hdmi}.` confirms the command was queued.
+The soundbar should switch to HDMI, proving Bluetooth serial control works
+before configuring Sendspin or Music Assistant.
+
+### 5. Find this machine's LAN address and HDMI audio device
 
 Find the LAN address that Music Assistant can reach:
 
@@ -100,7 +113,7 @@ sendspin audio-devices list
 
 Note the HDMI device you want Sendspin to use.
 
-### 5. Create the Yamaha / Sendspin profile
+### 6. Create the Yamaha / Sendspin profile
 
 ```sh
 mkdir -p ~/.config/yas207
@@ -122,7 +135,7 @@ Set:
 
 The supplied profile already uses the Yamaha logical input `hdmi`, the **Music** surround mode, and **Clear Voice** off while music is playing.
 
-### 6. Install the Sendspin adapter
+### 7. Install the Sendspin adapter
 
 ```sh
 sudo install -Dm755 \
@@ -132,7 +145,7 @@ sudo install -Dm755 \
 
 The adapter connects Sendspin's playback lifecycle and volume changes to the Yamaha controller.
 
-### 7. Start the Yamaha controller
+### 8. Start the Yamaha controller
 
 From the repository root:
 
@@ -148,7 +161,7 @@ You can check the controller from another terminal:
 curl -fsS http://127.0.0.1:8000/state
 ```
 
-### 8. Start Sendspin
+### 9. Start Sendspin
 
 Use the same LAN address and HDMI device that you put in the profile:
 
@@ -168,7 +181,7 @@ sendspin daemon \
 
 For example, replace `<THIS-MACHINE-IP>` with `192.168.1.50` and `<YOUR-HDMI-AUDIO-DEVICE>` with the HDMI device shown by `sendspin audio-devices list`.
 
-### 9. Play music
+### 10. Play music
 
 With Music Assistant on the same network, the Sendspin player should normally appear automatically.
 
@@ -184,7 +197,7 @@ During playback the soundbar should:
 
 When playback stops and the configured stop debounce expires, the controller restores the Yamaha state that was present before the music session started.
 
-### 10. Make it persistent
+### 11. Make it persistent
 
 Once the manual setup works, use the supplied systemd units for automatic startup:
 
